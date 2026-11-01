@@ -11,6 +11,7 @@ from voice_bot.providers import (
     HTTPTranscriber,
     SummaryContext,
     VoicePartContext,
+    summary_length_hint,
 )
 
 
@@ -131,11 +132,11 @@ async def test_summary_sends_context_as_data_not_instructions(settings):
 @pytest.mark.parametrize(
     "words,voice_count,expected_guidance",
     [
-        (40, 4, "1–3"),
-        (160, 4, "50–90"),
-        (260, 4, "90–140"),
-        (260, 1, "50–90"),
-        (450, 4, "90–140"),
+        (40, 4, "Короткая запись: 1–2"),
+        (160, 4, "70–80"),
+        (260, 4, "93–140"),
+        (260, 1, "70–80"),
+        (450, 4, "93–140"),
     ],
 )
 async def test_summary_detail_scales_with_material_without_dropping_batch_parts(
@@ -178,6 +179,37 @@ async def test_summary_detail_scales_with_material_without_dropping_batch_parts(
             transcript, context=context
         )
     assert result == "Первый абзац.\n\nВторой абзац."
+
+
+@pytest.mark.parametrize("words", [4, 20, 40, 80])
+def test_short_summary_target_never_expands_to_fill_larger_budget(settings, words):
+    settings.summary_short_target_words = 200
+    upper = max(1, words * 3 // 4)
+    lower = max(1, upper * 3 // 4)
+    hint = summary_length_hint("слово " * words, None, settings)
+    assert f"{lower}–{upper} слов" in hint
+    assert "1–2" in hint
+
+
+def test_summary_length_settings_are_loaded_from_env(settings, monkeypatch):
+    values = {
+        "SUMMARY_MIN_VOICE_SECONDS": "45",
+        "SUMMARY_SHORT_INPUT_WORDS": "60",
+        "SUMMARY_LONG_INPUT_WORDS": "200",
+        "SUMMARY_BATCH_DETAIL_MIN_WORDS": "120",
+        "SUMMARY_SHORT_TARGET_WORDS": "24",
+        "SUMMARY_MEDIUM_TARGET_WORDS": "48",
+        "SUMMARY_LONG_TARGET_WORDS": "96",
+    }
+    for key, value in values.items():
+        monkeypatch.setenv(key, value)
+    configured = type(settings)(_env_file=None)
+    assert configured.summary_min_voice_seconds == 45
+    assert "18–24" in summary_length_hint("слово " * 50, None, configured)
+    assert "42–48" in summary_length_hint("слово " * 150, None, configured)
+    assert "64–96" in summary_length_hint("слово " * 250, None, configured)
+    context = SummaryContext(voices=tuple(VoicePartContext(i, None, None, 30) for i in range(3)))
+    assert "64–96" in summary_length_hint("слово " * 150, context, configured)
 
 
 @pytest.mark.parametrize(

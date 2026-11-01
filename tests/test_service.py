@@ -139,9 +139,9 @@ async def test_voice_reply_collapsible_transcript_and_cleanup(settings):
 
 
 @pytest.mark.parametrize(
-    "duration,expected_summary", [(0, 0), (9, 0), (10, 0), (14, 0), (15, 1), (16, 1)]
+    "duration,expected_summary", [(0, 0), (14, 0), (15, 0), (20, 0), (29, 0), (30, 1), (31, 1)]
 )
-async def test_short_notes_are_transcribed_and_summary_starts_at_fifteen_seconds(
+async def test_short_notes_are_transcribed_and_summary_starts_at_thirty_seconds(
     settings, duration, expected_summary
 ):
     service, bot, _ = make_dependencies(settings)
@@ -159,6 +159,17 @@ async def test_short_notes_are_transcribed_and_summary_starts_at_fifteen_seconds
         assert "Коротко:" not in response
     assert "<blockquote expandable><b>Расшифровка:</b>\n" in response
     assert "Полный &lt;текст&gt; &amp; да.</blockquote>" in response
+
+
+async def test_summary_activation_threshold_is_configurable(settings):
+    settings.summary_min_voice_seconds = 45
+    service, bot, _ = make_dependencies(settings)
+    for index, duration in enumerate((30, 44, 45)):
+        message = make_message(duration=duration)
+        message.message_id = index + 1
+        await service.handle(message, bot)
+    assert service.transcriber.transcribe.await_count == 3
+    assert service.summarizer.summarize.await_count == 1
 
 
 @pytest.mark.parametrize("status", ["pending", "denied", "allowed"])
@@ -737,7 +748,7 @@ async def test_repeated_text_commands_share_one_queued_job(settings, monkeypatch
         "message_id": 42,
         "date": 0,
         "chat": {"id": 123, "type": "private"},
-        "voice": {"file_id": "id", "file_unique_id": "unique", "duration": 25},
+        "voice": {"file_id": "id", "file_unique_id": "unique", "duration": 35},
     }
     async with Bot(token="123456:TEST_TOKEN") as bot:
         monkeypatch.setattr(bot, "get_file", fake_bot.get_file)
