@@ -33,7 +33,7 @@ async def test_owner_not_started_bot_does_not_block_polling(settings, startup, c
     error = TelegramForbiddenError(
         method=SetMyCommands(commands=[]), message="SECRET Telegram request"
     )
-    bot.set_my_commands.side_effect = [True, error]
+    bot.set_my_commands.side_effect = [True, True, error]
     bot.send_message.side_effect = error
     await run(settings)
     dispatcher.start_polling.assert_awaited_once()
@@ -53,9 +53,16 @@ async def test_existing_webhook_is_not_removed_or_polled(settings, startup):
 async def test_admin_is_not_published_in_bot_command_menus(settings, startup):
     bot, _ = startup
     await run(settings)
-    assert bot.set_my_commands.await_count == 2
+    assert bot.set_my_commands.await_count == 3
     for call in bot.set_my_commands.await_args_list:
-        assert {command.command for command in call.args[0]} == {"start", "text"}
+        assert "admin" not in {command.command for command in call.args[0]}
+        assert all(command.is_ephemeral for command in call.args[0] if command.command == "text")
+    group_menu = bot.set_my_commands.await_args_list[1]
+    assert group_menu.kwargs["scope"].type == "all_group_chats"
+    commands = {command.command: command for command in group_menu.args[0]}
+    assert set(commands) == {"start", "text", "settings"}
+    assert commands["text"].is_ephemeral and commands["settings"].is_ephemeral
+    assert not commands["start"].is_ephemeral
 
 
 @pytest.mark.parametrize(

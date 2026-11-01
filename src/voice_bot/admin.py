@@ -18,9 +18,15 @@ from aiogram.types import (
 
 from voice_bot.config import Settings
 from voice_bot.groups import Group, GroupStatus, GroupStore
+from voice_bot.modes import settings_button
 
 logger = logging.getLogger(__name__)
-GREETING = "Я бот, который переводит голосовые в текст."
+GREETING = (
+    "Я перевожу голосовые в текст.\n\n"
+    "Обычный режим — расшифровываю голосовые автоматически для всей группы.\n"
+    "Тихий режим — только по /text в ответ на голосовое; результат видите только вы.\n\n"
+    "Назначьте меня администратором. Выбрать режим: /settings."
+)
 PAGE_SIZE = 6
 STATUS = {"pending": "⏳ Ожидает решения", "allowed": "✅ Разрешён", "denied": "⛔ Запрещён"}
 
@@ -42,6 +48,7 @@ def group_card(group: Group) -> tuple[str, InlineKeyboardMarkup]:
     text = (
         f"<b>{escape(group.title)}</b>\n<code>{group.chat_id}</code>\n"
         f"{STATUS[group.status] if group.present else 'Бот удалён из группы'}"
+        f"\nРежим: {'обычный' if group.mode == 'auto' else 'тихий'}"
     )
     rows = []
     if group.present:
@@ -74,7 +81,7 @@ class GroupAdmin:
         # Try the private owner notification first; lack of group send rights must not block it.
         await self.notify(group, bot)
         if joined and greet:
-            await self.safe_send(bot, chat.id, GREETING)
+            await self.safe_send(bot, chat.id, GREETING, settings_button())
 
     async def safe_send(
         self, bot: Bot, chat_id: int, text: str, markup: InlineKeyboardMarkup | None = None
@@ -231,7 +238,7 @@ def build_admin_router(admin: GroupAdmin) -> Router:
     async def start(message: Message, bot: Bot) -> None:
         if message.chat.type in {"group", "supergroup"}:
             await admin.observe(message.chat, bot, greet=False)
-            await message.answer(GREETING)
+            await message.answer(GREETING, reply_markup=settings_button())
             return
         me = await bot.me()
         rows = [

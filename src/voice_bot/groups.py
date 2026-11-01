@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, TypeAdapter
 
 GroupStatus = Literal["pending", "allowed", "denied"]
+GroupMode = Literal["auto", "quiet"]
 
 
 class Group(BaseModel, frozen=True):
@@ -18,6 +19,7 @@ class Group(BaseModel, frozen=True):
     present: bool = True
     revision: int = Field(default=1, ge=1)
     notified: bool = False
+    mode: GroupMode = "auto"
 
 
 class GroupStore:
@@ -92,3 +94,15 @@ class GroupStore:
         current = self.groups.get(group.chat_id)
         if current == group:
             self._save(group.model_copy(update={"notified": True}))
+
+    def set_mode(self, chat_id: int, revision: int, mode: GroupMode) -> Group | None:
+        group = self.groups.get(chat_id)
+        if group is None or not group.present or group.revision != revision:
+            return None
+        if group.mode == mode:
+            return group
+        return self._save(group.model_copy(update={"mode": mode, "revision": revision + 1}))
+
+    def automatic(self, chat_id: int) -> bool:
+        group = self.groups.get(chat_id)
+        return group is None or group.mode == "auto"

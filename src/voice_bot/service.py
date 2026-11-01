@@ -28,6 +28,7 @@ from voice_bot.batching import VoiceBatcher, batch_key
 from voice_bot.config import Settings
 from voice_bot.conversation import ConversationKey, ConversationMemory
 from voice_bot.deduplication import ProcessedVoices, RecentResults, voice_keys
+from voice_bot.delivery import ephemeral, recipient, reply_to
 from voice_bot.errors import ProviderError, UserFacingError
 from voice_bot.jobs import VoiceJobQueue
 from voice_bot.limits import NoticeLimiter, SenderKey, sender_key
@@ -151,15 +152,21 @@ class VoiceService:
             not self.settings.allowed_chat_ids or message.chat.id in self.settings.allowed_chat_ids
         )
 
+    def work_allowed(self, message: Message) -> bool:
+        return self.chat_allowed(message) and (
+            recipient(message) is not None
+            or self.admin is None
+            or self.admin.store.automatic(message.chat.id)
+        )
+
     async def send(self, message: Message, text: str) -> int | None:
         for attempt in range(2):
             try:
                 sent = await message.answer(
                     text,
                     parse_mode="HTML",
-                    reply_parameters=ReplyParameters(
-                        message_id=message.message_id, allow_sending_without_reply=False
-                    ),
+                    reply_parameters=reply_to(message),
+                    ephemeral_message_parameters=ephemeral(message),
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
                 if isinstance(sent, Message):
@@ -174,7 +181,11 @@ class VoiceService:
                         ),
                     )
                 sent_id = getattr(sent, "message_id", None)
-                return sent_id if isinstance(sent_id, int) else None
+                return (
+                    sent_id
+                    if not recipient(message) and isinstance(sent_id, int) and sent_id > 0
+                    else None
+                )
             except TelegramRetryAfter as exc:
                 if attempt or exc.retry_after > self.settings.telegram_max_retry_after_seconds:
                     raise
@@ -252,7 +263,11 @@ class VoiceService:
     async def enqueue(
         self, message: Message, bot: Bot, *, requester: Message | None = None
     ) -> None:
-        if not self.batcher.closed and await self._claim(message, requester):
+        if (
+            self.work_allowed(message)
+            and not self.batcher.closed
+            and await self._claim(message, requester)
+        ):
             await self._enqueue_batch([message], bot)
 
     async def _enqueue_batch(self, messages: list[Message], bot: Bot) -> None:
@@ -262,7 +277,7 @@ class VoiceService:
         try:
             if self.admin is not None and message.chat.type in {"group", "supergroup"}:
                 await self.admin.observe(message.chat, bot)
-            if not self.chat_allowed(message):
+            if not self.work_allowed(message):
                 return
             queued = self.queue.add(messages, bot)
             if not queued:
@@ -284,6 +299,10 @@ class VoiceService:
 
     async def accept(self, message: Message, bot: Bot) -> None:
         if self.batcher.closed:
+            return
+        if self.admin is not None and message.chat.type in {"group", "supergroup"}:
+            await self.admin.observe(message.chat, bot)
+        if not self.work_allowed(message):
             return
         if not self.settings.voice_batch_pause_seconds or batch_key(message) is None:
             await self.enqueue(message, bot)
@@ -355,7 +374,7 @@ class VoiceService:
         try:
             if self.admin is not None and message.chat.type in {"group", "supergroup"}:
                 await self.admin.observe(message.chat, bot)
-            if not self.chat_allowed(message):
+            if not self.work_allowed(message):
                 logger.debug("voice_ignored reason=chat_not_allowed chat_id=%s", message.chat.id)
                 return
             if not self.processed.available:
@@ -379,7 +398,7 @@ class VoiceService:
                 key = None
             deadline = asyncio.get_running_loop().time() + self.settings.job_timeout_seconds
             async with self.memory.ordered(key, deadline):
-                saved = self.processed.reply_ids(messages[0])
+                saved = () if recipient(message) else self.processed.reply_ids(messages[0])
                 copied = None
                 if saved and all(self.processed.reply_ids(item) == saved for item in messages):
                     async with asyncio.timeout_at(deadline):
@@ -433,7 +452,7 @@ class VoiceService:
             )
         if voice.file_size and voice.file_size > settings.max_download_bytes:
             raise UserFacingError("Голосовое слишком большое для обработки.")
-        cache_key = "transcript:" + voice_keys(message)[-1]
+        cache_key = "transcript:" + voice_keys(message, scoped=False)[-1]
         cached = self.results.get(cache_key)
         if cached is not None:
             return cached
@@ -461,7 +480,7 @@ class VoiceService:
                 timeout_seconds=settings.conversion_timeout_seconds,
             )
             logger.info("audio_converted message_id=%s", message.message_id)
-            if not self.chat_allowed(message):
+            if not self.work_allowed(message):
                 raise UserFacingError("Обработка в этом чате отключена.")
             transcript = await self.transcriber.transcribe(wav)
             self.results.put(cache_key, transcript)
@@ -494,7 +513,7 @@ class VoiceService:
         try:
             async with asyncio.timeout_at(deadline):
                 for index, item in enumerate(messages):
-                    if not self.chat_allowed(item):
+                    if not self.work_allowed(item):
                         return []
                     if not await self._charge_private(item):
                         if not is_batch:
@@ -512,7 +531,7 @@ class VoiceService:
                             raise
                         logger.warning("batch_part_failed error_type=%s", type(exc).__name__)
                         failures[index] = "Не удалось распознать запись."
-                if not self.chat_allowed(message):
+                if not self.work_allowed(message):
                     return []
                 transcript = self._joined(transcripts, failures)
                 if needs_summary and any(part is not None for part in transcripts):
@@ -544,7 +563,7 @@ class VoiceService:
                     try:
                         cache_key = (
                             "summary:"
-                            + ":".join(voice_keys(item)[0] for item in messages)
+                            + ":".join(voice_keys(item, scoped=False)[0] for item in messages)
                             + ":"
                             + hashlib.sha256(transcript.encode()).hexdigest()
                         )
@@ -563,7 +582,7 @@ class VoiceService:
             if not any(part is not None for part in transcripts):
                 raise
             logger.warning("voice_job_timeout")
-        if not self.chat_allowed(message):
+        if not self.work_allowed(message):
             return []
         transcript = self._joined(transcripts, failures)
         if is_batch and all(part is None for part in transcripts):
@@ -600,6 +619,13 @@ class VoiceService:
     ) -> tuple[int, ...] | None:
         content_hash = hashlib.sha256(((summary or "") + "\0" + transcript).encode()).hexdigest()
         delivery_key = "delivery:" + voice_keys(message)[0] + ":" + content_hash
+        if recipient(message):
+            requester = self._requesters.get(voice_keys(message)[0], message)
+            # Telegram may reuse an ephemeral ID after expiry. A later command is a new delivery.
+            delivery_key += (
+                f":{requester.ephemeral_message_id or requester.message_id}"
+                f":{requester.date.timestamp()}"
+            )
         if count == 1:
             return await self._send_text_result(message, summary, transcript, delivery_key)
         if self.results.get("fallback:" + delivery_key) is None:
@@ -610,12 +636,17 @@ class VoiceService:
                             chat_id=message.chat.id,
                             message_thread_id=getattr(message, "message_thread_id", None),
                             rich_message=render_batch(summary, transcript, count),
+                            ephemeral_message_parameters=ephemeral(message),
                             reply_parameters=ReplyParameters(
                                 message_id=message.message_id, allow_sending_without_reply=False
                             ),
                         )
                         sent_id = getattr(sent, "message_id", None)
-                        return (sent_id,) if isinstance(sent_id, int) else ()
+                        return (
+                            (sent_id,)
+                            if not recipient(message) and isinstance(sent_id, int)
+                            else ()
+                        )
                     except TelegramRetryAfter as exc:
                         if (
                             attempt
@@ -639,7 +670,7 @@ class VoiceService:
         for index, reply in enumerate(render_replies(summary, transcript)):
             if index < sent_parts:
                 continue
-            if not self.chat_allowed(message):
+            if not self.work_allowed(message):
                 return None
             sent_id = await self.send(message, reply)
             if isinstance(sent_id, int):

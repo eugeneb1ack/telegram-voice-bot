@@ -14,9 +14,13 @@ from typing import TextIO
 
 from aiogram.types import Message
 
+from voice_bot.delivery import recipient
 
-def voice_keys(message: Message) -> tuple[str, ...]:
+
+def voice_keys(message: Message, *, scoped: bool = True) -> tuple[str, ...]:
     def digest(parts: tuple[object, ...]) -> str:
+        if scoped and (user_id := recipient(message)) is not None:
+            parts += ("recipient", user_id)
         return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
 
     keys = [digest(("message", message.chat.id, message.message_id))]
@@ -170,7 +174,10 @@ class ProcessedVoices:
     async def complete(self, messages: Iterable[Message], replies: tuple[int, ...] = ()) -> None:
         async with self._lock:
             replies = replies if len(replies) <= 1024 else ()
-            fresh = [Receipt(voice_keys(message), replies) for message in messages]
+            fresh = [
+                Receipt(voice_keys(message), () if recipient(message) else replies)
+                for message in messages
+            ]
             fresh = [item for item in fresh if self.receipts.get(item.keys[0]) != item]
             if not fresh:
                 return
