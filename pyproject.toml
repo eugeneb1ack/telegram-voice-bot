@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "voice-bot"
+version = "0.1.0"
+description = "Telegram voice summaries and complete collapsible transcripts"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "aiogram[proxy]>=3.31.0,<4",
+  "httpx[socks]>=0.28.1,<0.29",
+  "pydantic-settings>=2.11,<3",
+  "regex>=2026.9.18",
+]
+
+[project.scripts]
+voice-bot = "voice_bot.__main__:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<10", "pytest-asyncio>=1.2,<2", "ruff>=0.14,<1", "mypy>=1.18,<2",
+  "types-regex>=2025.9.18",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+
