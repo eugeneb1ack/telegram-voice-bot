@@ -20,8 +20,15 @@ def sender_key(message: Message) -> SenderKey | None:
 
 
 class NoticeLimiter:
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        *,
+        sender_interval: float = 30,
+        chat_interval: float = 5,
+    ) -> None:
         self.clock = clock
+        self.sender_interval, self.chat_interval = sender_interval, chat_interval
         self.senders: OrderedDict[SenderKey, float] = OrderedDict()
         self.chats: OrderedDict[int, float] = OrderedDict()
 
@@ -33,8 +40,8 @@ class NoticeLimiter:
         key = sender_key(message) or (message.chat.id, "unknown", 0)
         if key in self.senders or message.chat.id in self.chats:
             return False
-        self.senders[key] = now + 30
-        self.chats[message.chat.id] = now + 5
+        self.senders[key] = now + self.sender_interval
+        self.chats[message.chat.id] = now + self.chat_interval
         for entries in (self.senders, self.chats):
             while len(entries) > 2048:
                 entries.popitem(last=False)

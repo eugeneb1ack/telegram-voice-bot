@@ -88,6 +88,27 @@ async def test_completing_receipt_twice_does_not_grow_file(tmp_path):
     assert path.read_bytes() == before
 
 
+async def test_reply_ids_survive_restart_and_legacy_receipts_can_be_upgraded(tmp_path):
+    path = tmp_path / "processed.jsonl"
+    store = ProcessedVoices(path)
+    await store.complete([voice()])
+    assert store.reply_ids(voice()) == ()
+    await store.complete([voice()], (101, 102))
+    reloaded = ProcessedVoices(path)
+    assert reloaded.reply_ids(voice(index=2)) == (101, 102)
+    assert reloaded.claim(voice(index=2), completed_ok=True)
+    assert "same-audio" not in path.read_text()
+    assert json.loads(path.read_text().splitlines()[-1])["replies"] == [101, 102]
+
+
+async def test_newest_reply_pointer_remains_valid_when_older_receipt_is_evicted(tmp_path):
+    store = ProcessedVoices(tmp_path / "processed.jsonl", max_entries=2)
+    await store.complete([voice(1)], (101,))
+    await store.complete([voice(2)], (102,))
+    await store.complete([voice(3, unique="another")], (103,))
+    assert store.reply_ids(voice(4)) == (102,)
+
+
 @pytest.mark.parametrize("content", ["broken", '["raw-message-id"]\n', "{}\n", "[]\n"])
 def test_corrupt_receipts_fail_closed_instead_of_resetting_history(tmp_path, content):
     path = tmp_path / "processed.jsonl"

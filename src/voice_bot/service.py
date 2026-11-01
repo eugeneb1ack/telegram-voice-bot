@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import logging
 import tempfile
 from collections import Counter
@@ -120,6 +121,9 @@ class VoiceService:
             settings.private_usage_file, settings.private_daily_voice_limit
         )
         self.notices = NoticeLimiter()
+        self.replays = NoticeLimiter(sender_interval=3, chat_interval=1)
+        self._quota_charged: set[str] = set()
+        self._sent_ids: dict[str, tuple[int, ...]] = {}
         self._owners: dict[str, SenderKey] = {}
         self._pending_by_sender: Counter[SenderKey] = Counter()
         self._requesters: dict[str, Message] = {}
@@ -147,7 +151,7 @@ class VoiceService:
             not self.settings.allowed_chat_ids or message.chat.id in self.settings.allowed_chat_ids
         )
 
-    async def send(self, message: Message, text: str) -> None:
+    async def send(self, message: Message, text: str) -> int | None:
         for attempt in range(2):
             try:
                 sent = await message.answer(
@@ -169,11 +173,13 @@ class VoiceService:
                             entity.type == "expandable_blockquote" for entity in sent.entities or []
                         ),
                     )
-                return
+                sent_id = getattr(sent, "message_id", None)
+                return sent_id if isinstance(sent_id, int) else None
             except TelegramRetryAfter as exc:
                 if attempt or exc.retry_after > self.settings.telegram_max_retry_after_seconds:
                     raise
                 await asyncio.sleep(exc.retry_after)
+        return None
 
     async def handle(self, message: Message, bot: Bot) -> None:
         await self._handle_messages([message], bot)
@@ -186,10 +192,34 @@ class VoiceService:
             if not self._pending_by_sender[actor]:
                 del self._pending_by_sender[actor]
         self._requesters.pop(key, None)
+        self._quota_charged.discard(key)
         self.processed.release(message, failed=failed)
 
+    async def _charge_private(self, message: Message) -> bool:
+        if getattr(message.chat, "type", None) != "private":
+            return True
+        key = voice_keys(message)[0]
+        if key in self._quota_charged:
+            return True
+        decision = await self.private_quota.admit(message)
+        if decision == "allowed":
+            self._quota_charged.add(key)
+            return True
+        if decision == "notify":
+            await self.notify(
+                message,
+                f"В личке доступно {self.settings.private_daily_voice_limit} голосовых в день. "
+                "Лимит обновится в 00:00 UTC.",
+                force=True,
+            )
+        return False
+
+    async def _refund_private(self, message: Message) -> None:
+        if voice_keys(message)[0] in self._quota_charged:
+            await self.private_quota.refund(message)
+
     async def _claim(self, message: Message, requester: Message | None = None) -> bool:
-        if not self.processed.claim(message):
+        if not self.processed.claim(message, completed_ok=True):
             return False
         target = requester or message
         actor = (
@@ -208,15 +238,9 @@ class VoiceService:
             self._requesters[voice_keys(message)[0]] = requester
         accepted = False
         try:
-            decision = await self.private_quota.admit(message)
-            accepted = decision == "allowed"
-            if decision == "notify":
-                await self.notify(
-                    message,
-                    f"В личке доступно {self.settings.private_daily_voice_limit} голосовых в день. "
-                    "Лимит обновится в 00:00 UTC.",
-                    force=True,
-                )
+            accepted = bool(self.processed.reply_ids(message)) or await self._charge_private(
+                message
+            )
             return accepted
         except OSError:
             logger.error("private_quota_storage_unavailable")
@@ -252,7 +276,7 @@ class VoiceService:
             if not queued:
                 for item in messages:
                     try:
-                        await self.private_quota.refund(item)
+                        await self._refund_private(item)
                     except OSError:
                         logger.error("private_quota_storage_unavailable")
                     finally:
@@ -280,7 +304,7 @@ class VoiceService:
         finally:
             if not accepted:
                 try:
-                    await self.private_quota.refund(message)
+                    await self._refund_private(message)
                 except OSError:
                     logger.error("private_quota_storage_unavailable")
                 finally:
@@ -314,6 +338,8 @@ class VoiceService:
         self._owners.clear()
         self._pending_by_sender.clear()
         self._requesters.clear()
+        self._quota_charged.clear()
+        self._sent_ids.clear()
         self.results.clear()
 
     async def _handle_messages(self, messages: list[Message], bot: Bot) -> None:
@@ -353,9 +379,25 @@ class VoiceService:
                 key = None
             deadline = asyncio.get_running_loop().time() + self.settings.job_timeout_seconds
             async with self.memory.ordered(key, deadline):
-                completed = await self._process(messages, bot, key, times, deadline)
+                saved = self.processed.reply_ids(messages[0])
+                copied = None
+                if saved and all(self.processed.reply_ids(item) == saved for item in messages):
+                    async with asyncio.timeout_at(deadline):
+                        copied = await self._copy_result(message, bot, saved)
+                if copied is not None:
+                    completed = messages
+                    for item in messages:
+                        await self._refund_private(item)
+                    if not copied:
+                        return
+                    self._sent_ids[voice_keys(message)[0]] = copied
+                    logger.info("voice_job_replayed message_id=%s", message.message_id)
+                else:
+                    completed = await self._process(messages, bot, key, times, deadline)
                 try:
-                    await self.processed.complete(completed)
+                    await self.processed.complete(
+                        completed, self._sent_ids.pop(voice_keys(message)[0], ())
+                    )
                 except OSError:
                     # The result was delivered. Stop admitting paid work if receipts fail.
                     logger.error("processing_receipts_unavailable")
@@ -372,6 +414,7 @@ class VoiceService:
             logger.warning("voice_processing_failed error_type=%s", type(exc).__name__)
             await self._send_error(message, "Не удалось обработать голосовое. Попробуйте позже.")
         finally:
+            self._sent_ids.pop(voice_keys(message)[0], None)
             completed_ids = {item.message_id for item in completed}
             for item in messages:
                 self._release(item, failed=admitted and item.message_id not in completed_ids)
@@ -453,6 +496,11 @@ class VoiceService:
                 for index, item in enumerate(messages):
                     if not self.chat_allowed(item):
                         return []
+                    if not await self._charge_private(item):
+                        if not is_batch:
+                            return []
+                        failures[index] = "Достигнут дневной лимит."
+                        continue
                     try:
                         transcripts[index] = await self._transcribe(item, bot)
                     except (UserFacingError, ProviderError) as exc:
@@ -522,8 +570,10 @@ class VoiceService:
             summary = "Не удалось распознать записи. Причины указаны в общей расшифровке."
         elif is_batch and any(part is None for part in transcripts):
             summary = "Часть записей не обработана.\n\n" + (summary or "")
-        if not await self._send_result(message, bot, summary, transcript, len(messages)):
+        sent_ids = await self._send_result(message, bot, summary, transcript, len(messages))
+        if sent_ids is None:
             return []
+        self._sent_ids[voice_keys(message)[0]] = sent_ids
         logger.info("voice_job_delivered message_id=%s", message.message_id)
         # Store a short successful summary; short notes reuse STT without another API call.
         if all(part is not None for part in transcripts) and self.chat_allowed(message):
@@ -547,7 +597,7 @@ class VoiceService:
 
     async def _send_result(
         self, message: Message, bot: Bot, summary: str | None, transcript: str, count: int
-    ) -> bool:
+    ) -> tuple[int, ...] | None:
         content_hash = hashlib.sha256(((summary or "") + "\0" + transcript).encode()).hexdigest()
         delivery_key = "delivery:" + voice_keys(message)[0] + ":" + content_hash
         if count == 1:
@@ -556,7 +606,7 @@ class VoiceService:
             try:
                 for attempt in range(2):
                     try:
-                        await bot.send_rich_message(
+                        sent = await bot.send_rich_message(
                             chat_id=message.chat.id,
                             message_thread_id=getattr(message, "message_thread_id", None),
                             rich_message=render_batch(summary, transcript, count),
@@ -564,7 +614,8 @@ class VoiceService:
                                 message_id=message.message_id, allow_sending_without_reply=False
                             ),
                         )
-                        return True
+                        sent_id = getattr(sent, "message_id", None)
+                        return (sent_id,) if isinstance(sent_id, int) else ()
                     except TelegramRetryAfter as exc:
                         if (
                             attempt
@@ -581,16 +632,64 @@ class VoiceService:
 
     async def _send_text_result(
         self, message: Message, summary: str | None, transcript: str, delivery_key: str
-    ) -> bool:
+    ) -> tuple[int, ...] | None:
         sent_parts = int(self.results.get(delivery_key) or "0")
+        ids_key = "ids:" + delivery_key
+        sent_ids: list[int] = json.loads(self.results.get(ids_key) or "[]")
         for index, reply in enumerate(render_replies(summary, transcript)):
             if index < sent_parts:
                 continue
             if not self.chat_allowed(message):
-                return False
-            await self.send(message, reply)
+                return None
+            sent_id = await self.send(message, reply)
+            if isinstance(sent_id, int):
+                sent_ids.append(sent_id)
+                self.results.put(ids_key, json.dumps(sent_ids))
             self.results.put(delivery_key, str(index + 1))
-        return True
+        return tuple(sent_ids)
+
+    async def _copy_result(
+        self, message: Message, bot: Bot, saved: tuple[int, ...]
+    ) -> tuple[int, ...] | None:
+        requester = self._requesters.get(voice_keys(message)[0], message)
+        if not self.replays.allow(requester):
+            return ()
+        signature = hashlib.sha256(json.dumps(saved).encode()).hexdigest()
+        progress_key = "copy:" + voice_keys(message)[0] + ":" + signature
+        copied: list[int] = json.loads(self.results.get(progress_key) or "[]")
+        try:
+            for source_id in saved[len(copied) :]:
+                if not self.chat_allowed(message):
+                    return ()
+                for attempt in range(2):
+                    try:
+                        result = await bot.copy_message(
+                            chat_id=message.chat.id,
+                            from_chat_id=message.chat.id,
+                            message_id=source_id,
+                            message_thread_id=getattr(message, "message_thread_id", None),
+                            reply_parameters=ReplyParameters(
+                                message_id=message.message_id, allow_sending_without_reply=False
+                            ),
+                        )
+                        copied.append(result.message_id)
+                        self.results.put(progress_key, json.dumps(copied))
+                        break
+                    except TelegramRetryAfter as exc:
+                        if (
+                            attempt
+                            or exc.retry_after > self.settings.telegram_max_retry_after_seconds
+                        ):
+                            raise
+                        await asyncio.sleep(exc.retry_after)
+        except TelegramBadRequest:
+            # A deleted source can be regenerated; an uncertain network result cannot.
+            self.results.put(progress_key, "[]")
+            for message_id in copied:
+                await bot.delete_message(chat_id=message.chat.id, message_id=message_id)
+            logger.info("cached_reply_unavailable message_id=%s", message.message_id)
+            return None
+        return tuple(copied)
 
     async def _send_error(self, message: Message, text: str) -> None:
         await self.notify(message, text)

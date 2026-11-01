@@ -8,6 +8,7 @@ import tempfile
 import time
 from collections import Counter, OrderedDict, deque
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TextIO
 
@@ -34,6 +35,12 @@ def voice_keys(message: Message) -> tuple[str, ...]:
     return tuple(keys)
 
 
+@dataclass(frozen=True)
+class Receipt:
+    keys: tuple[str, ...]
+    replies: tuple[int, ...] = ()
+
+
 class ProcessedVoices:
     def __init__(
         self,
@@ -45,7 +52,8 @@ class ProcessedVoices:
         self.path = path
         self.max_entries = max_entries
         self.clock = clock
-        self.records: deque[tuple[str, ...]] = deque()
+        self.records: deque[Receipt] = deque()
+        self.receipts: dict[str, Receipt] = {}
         self.completed: Counter[str] = Counter()
         self.pending: set[str] = set()
         self.cooldowns: OrderedDict[str, float] = OrderedDict()
@@ -57,7 +65,11 @@ class ProcessedVoices:
                 raise ValueError("Processing receipts exceed the storage limit")
             with path.open(encoding="utf-8") as file:
                 for line in file:
-                    keys = json.loads(line)
+                    raw = json.loads(line)
+                    if isinstance(raw, dict) and set(raw) != {"keys", "replies"}:
+                        raise ValueError("Invalid processing receipt fields")
+                    keys = raw.get("keys") if isinstance(raw, dict) else raw
+                    replies = raw.get("replies", []) if isinstance(raw, dict) else []
                     if (
                         not isinstance(keys, list)
                         or not 1 <= len(keys) <= 2
@@ -69,23 +81,40 @@ class ProcessedVoices:
                         )
                     ):
                         raise ValueError("Invalid processing receipt")
-                    self._remember(tuple(keys))
+                    if (
+                        not isinstance(replies, list)
+                        or len(replies) > 1024
+                        or any(type(item) is not int or item <= 0 for item in replies)
+                    ):
+                        raise ValueError("Invalid Telegram reply identifiers")
+                    self._remember(Receipt(tuple(keys), tuple(replies)))
                     self.rows += 1
         # Refuse to start processing if receipts cannot be persisted.
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("ab"):
             path.chmod(0o600)
 
-    def _remember(self, keys: tuple[str, ...]) -> None:
+    def _remember(self, receipt: Receipt) -> None:
         if len(self.records) >= self.max_entries:
-            for key in self.records.popleft():
+            old = self.records.popleft()
+            for key in old.keys:
                 self.completed[key] -= 1
                 if not self.completed[key]:
                     del self.completed[key]
-        self.records.append(keys)
-        self.completed.update(keys)
+                if self.receipts.get(key) is old:
+                    del self.receipts[key]
+        self.records.append(receipt)
+        self.completed.update(receipt.keys)
+        for key in receipt.keys:
+            self.receipts[key] = receipt
 
-    def claim(self, message: Message) -> bool:
+    def reply_ids(self, message: Message) -> tuple[int, ...]:
+        for key in reversed(voice_keys(message)):
+            if receipt := self.receipts.get(key):
+                return receipt.replies
+        return ()
+
+    def claim(self, message: Message, *, completed_ok: bool = False) -> bool:
         if not self.available or not message.voice:
             return False
         now = self.clock()
@@ -93,7 +122,10 @@ class ProcessedVoices:
             self.cooldowns.popitem(last=False)
         keys = voice_keys(message)
         if any(
-            key in self.completed or key in self.pending or key in self.cooldowns for key in keys
+            (key in self.completed and not completed_ok)
+            or key in self.pending
+            or key in self.cooldowns
+            for key in keys
         ):
             return False
         self.pending.update(keys)
@@ -109,7 +141,7 @@ class ProcessedVoices:
             while len(self.cooldowns) > 2048:
                 self.cooldowns.popitem(last=False)
 
-    def _write(self, records: list[tuple[str, ...]], *, compact: bool) -> None:
+    def _write(self, records: list[Receipt], *, compact: bool) -> None:
         temporary: Path | None = None
         file: TextIO
         try:
@@ -120,8 +152,13 @@ class ProcessedVoices:
             else:
                 file = self.path.open("a", encoding="utf-8")
             with file:
-                for keys in records:
-                    file.write(json.dumps(keys, separators=(",", ":")) + "\n")
+                for receipt in records:
+                    data = (
+                        {"keys": receipt.keys, "replies": receipt.replies}
+                        if receipt.replies
+                        else receipt.keys
+                    )
+                    file.write(json.dumps(data, separators=(",", ":")) + "\n")
                 file.flush()
                 os.fsync(file.fileno())
             if temporary is not None:
@@ -130,10 +167,11 @@ class ProcessedVoices:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
-    async def complete(self, messages: Iterable[Message]) -> None:
+    async def complete(self, messages: Iterable[Message], replies: tuple[int, ...] = ()) -> None:
         async with self._lock:
-            fresh = [voice_keys(message) for message in messages]
-            fresh = [keys for keys in fresh if not any(key in self.completed for key in keys)]
+            replies = replies if len(replies) <= 1024 else ()
+            fresh = [Receipt(voice_keys(message), replies) for message in messages]
+            fresh = [item for item in fresh if self.receipts.get(item.keys[0]) != item]
             if not fresh:
                 return
             compact = self.rows + len(fresh) > self.max_entries * 2
@@ -151,8 +189,8 @@ class ProcessedVoices:
                 raise
             finally:
                 if write.done() and not write.cancelled() and write.exception() is None:
-                    for keys in fresh:
-                        self._remember(keys)
+                    for receipt in fresh:
+                        self._remember(receipt)
                     self.rows = len(records) if compact else self.rows + len(fresh)
 
 

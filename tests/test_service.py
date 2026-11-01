@@ -29,7 +29,7 @@ def make_message(*, duration=30, size=100, chat_id=123):
         voice=SimpleNamespace(duration=duration, file_size=size, file_id="voice-id"),
         chat=SimpleNamespace(id=chat_id),
         message_id=42,
-        answer=AsyncMock(),
+        answer=AsyncMock(return_value=SimpleNamespace(message_id=1000)),
     )
 
 
@@ -47,7 +47,9 @@ def make_dependencies(settings):
     bot = SimpleNamespace(
         get_file=AsyncMock(return_value=SimpleNamespace(file_path="voice/file.ogg", file_size=100)),
         download_file=AsyncMock(side_effect=download),
-        send_rich_message=AsyncMock(),
+        send_rich_message=AsyncMock(return_value=SimpleNamespace(message_id=1000)),
+        copy_message=AsyncMock(return_value=SimpleNamespace(message_id=2000)),
+        delete_message=AsyncMock(),
     )
     transcriber = SimpleNamespace(transcribe=AsyncMock(return_value="Полный <текст> & да."))
     summarizer = SimpleNamespace(summarize=AsyncMock(return_value="Кратко."))
@@ -741,7 +743,7 @@ async def test_definitive_rich_rejection_falls_back_without_losing_transcript(se
 
 async def test_repeated_text_commands_share_one_queued_job(settings, monkeypatch):
     service, fake_bot, _ = make_dependencies(settings)
-    service.send = AsyncMock()
+    service.send = AsyncMock(return_value=1000)
     dispatcher = Dispatcher()
     dispatcher.include_router(build_router(service))
     original = {
@@ -753,6 +755,7 @@ async def test_repeated_text_commands_share_one_queued_job(settings, monkeypatch
     async with Bot(token="123456:TEST_TOKEN") as bot:
         monkeypatch.setattr(bot, "get_file", fake_bot.get_file)
         monkeypatch.setattr(bot, "download_file", fake_bot.download_file)
+        monkeypatch.setattr(bot, "copy_message", fake_bot.copy_message)
         await dispatcher.feed_update(
             bot, Update.model_validate({"update_id": 1, "message": original})
         )
@@ -787,6 +790,7 @@ async def test_completed_voice_stays_protected_after_service_restart(settings):
     new_bot.get_file.assert_not_awaited()
     restarted.transcriber.transcribe.assert_not_awaited()
     restarted.summarizer.summarize.assert_not_awaited()
+    new_bot.copy_message.assert_awaited_once()
     message.answer.assert_awaited_once()
 
 
@@ -826,9 +830,10 @@ async def test_partial_batch_retries_only_failed_voice_after_cooldown(settings):
     await service._handle_messages(messages, bot)
     assert service.transcriber.transcribe.await_count == 4
     assert bot.get_file.await_count == 4
-    assert messages[1].answer.await_count == 1
-    assert bot.send_rich_message.await_count == 1
-    assert len(service.processed.records) == 3
+    assert messages[1].answer.await_count == 0
+    assert bot.send_rich_message.await_count == 2
+    bot.copy_message.assert_awaited_once()
+    assert all(service.processed.reply_ids(message) == (1000,) for message in messages)
 
 
 async def test_failed_attempt_cannot_be_retriggered_by_command_spam(settings):
@@ -1049,3 +1054,124 @@ async def test_private_quota_write_failure_never_reaches_download(settings, monk
     bot.get_file.assert_not_awaited()
     service.transcriber.transcribe.assert_not_awaited()
     assert not service.processed.pending
+
+
+async def test_repeated_forward_copies_complete_telegram_reply_without_api(settings):
+    service, bot, _ = make_dependencies(settings)
+    first = identified_message(1)
+    first.voice.file_unique_id = "recording"
+    await service.handle(first, bot)
+    duplicate = identified_message(2, forwarded=True)
+    duplicate.voice.file_unique_id = "recording"
+    await service.handle(duplicate, bot)
+    bot.get_file.assert_awaited_once()
+    service.transcriber.transcribe.assert_awaited_once()
+    service.summarizer.summarize.assert_awaited_once()
+    bot.copy_message.assert_awaited_once()
+    call = bot.copy_message.await_args.kwargs
+    assert call["from_chat_id"] == call["chat_id"] == 123
+    assert call["message_id"] == 1000
+    assert call["reply_parameters"].message_id == 2
+    duplicate.answer.assert_not_awaited()
+    assert service.processed.reply_ids(duplicate) == (2000,)
+
+
+async def test_deleted_cached_reply_falls_back_to_processing(settings):
+    service, bot, _ = make_dependencies(settings)
+    message = make_message()
+    await service.processed.complete([message], (999,))
+    bot.copy_message.side_effect = TelegramBadRequest(
+        method=SendMessage(chat_id=123, text="test"), message="message not found"
+    )
+    await service.handle(message, bot)
+    bot.copy_message.assert_awaited_once()
+    bot.get_file.assert_awaited_once()
+    service.transcriber.transcribe.assert_awaited_once()
+    assert service.processed.reply_ids(message) == (1000,)
+
+
+async def test_legacy_receipt_without_reply_id_never_silently_drops_voice(settings):
+    service, bot, _ = make_dependencies(settings)
+    message = make_message(duration=25)
+    await service.processed.complete([message])
+    await service.handle(message, bot)
+    service.transcriber.transcribe.assert_awaited_once()
+    service.summarizer.summarize.assert_not_awaited()
+    message.answer.assert_awaited_once()
+    assert "Расшифровка:" in message.answer.await_args.args[0]
+
+
+async def test_cached_private_reply_is_free_even_when_daily_allowance_is_used(settings):
+    settings.private_daily_voice_limit = 1
+    service, bot, _ = make_dependencies(settings)
+    message = make_message()
+    message.chat.type = "private"
+    await service.handle(message, bot)
+    assert list(service.private_quota.users.values())[0].used == 1
+    await service.handle(message, bot)
+    bot.copy_message.assert_awaited_once()
+    assert list(service.private_quota.users.values())[0].used == 1
+    service.transcriber.transcribe.assert_awaited_once()
+
+
+async def test_cached_batch_is_copied_once_with_all_transcripts(settings):
+    service, bot, _ = make_dependencies(settings)
+    messages = [identified_message(i, forwarded=True) for i in (1, 2, 3)]
+    await service.processed.complete(messages, (999,))
+    await service._handle_messages(messages, bot)
+    bot.copy_message.assert_awaited_once()
+    assert bot.copy_message.await_args.kwargs["reply_parameters"].message_id == 3
+    bot.get_file.assert_not_awaited()
+    service.transcriber.transcribe.assert_not_awaited()
+    service.summarizer.summarize.assert_not_awaited()
+
+
+async def test_copy_network_timeout_never_starts_paid_fallback(settings):
+    service, bot, _ = make_dependencies(settings)
+    message = make_message()
+    await service.processed.complete([message], (999,))
+    bot.copy_message.side_effect = TelegramNetworkError(
+        method=SendMessage(chat_id=123, text="test"), message="SECRET timeout"
+    )
+    await service.handle(message, bot)
+    bot.get_file.assert_not_awaited()
+    service.transcriber.transcribe.assert_not_awaited()
+
+
+async def test_repeated_cached_requests_cannot_flood_telegram(settings):
+    service, bot, _ = make_dependencies(settings)
+    message = make_message()
+    await service.processed.complete([message], (999,))
+    for _ in range(20):
+        await service.handle(message, bot)
+    bot.copy_message.assert_awaited_once()
+    bot.get_file.assert_not_awaited()
+
+
+async def test_deleted_private_reply_does_not_bypass_daily_allowance(settings):
+    settings.private_daily_voice_limit = 1
+    service, bot, _ = make_dependencies(settings)
+    message = make_message()
+    message.chat.type = "private"
+    await service.private_quota.admit(message)
+    await service.processed.complete([message], (999,))
+    bot.copy_message.side_effect = TelegramBadRequest(
+        method=SendMessage(chat_id=123, text="test"), message="missing"
+    )
+    await service.handle(message, bot)
+    bot.get_file.assert_not_awaited()
+    service.transcriber.transcribe.assert_not_awaited()
+    assert list(service.private_quota.users.values())[0].used == 1
+
+
+async def test_missing_split_reply_cleans_partial_copy_before_regenerating(settings):
+    service, bot, _ = make_dependencies(settings)
+    message = make_message()
+    await service.processed.complete([message], (999, 1001))
+    bot.copy_message.side_effect = [
+        SimpleNamespace(message_id=2001),
+        TelegramBadRequest(method=SendMessage(chat_id=123, text="test"), message="missing"),
+    ]
+    await service.handle(message, bot)
+    bot.delete_message.assert_awaited_once_with(chat_id=123, message_id=2001)
+    service.transcriber.transcribe.assert_awaited_once()

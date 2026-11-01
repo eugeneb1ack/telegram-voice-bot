@@ -44,7 +44,7 @@ specified in `OWNER_ID`, send `/admin` to the bot in a private chat and approve 
 Temporary audio files are deleted after processing. Transcripts are not saved to disk
 or included in application logs. Pending jobs and recent context stay in RAM;
 context and temporary delivery results are automatically cleared. The Docker volume
-`group-state` stores group permissions, usage counters and hashes of processed message identifiers.
+`group-state` stores group permissions, usage counters, identifier hashes and Telegram reply IDs.
 Operational logs contain no voice message content.
 Audio, text and context are sent to OpenAI for processing; replies remain in Telegram.
 
