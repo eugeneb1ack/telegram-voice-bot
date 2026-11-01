@@ -18,10 +18,232 @@ from aiogram.types import (
     User,
 )
 
+from voice_bot.admin import GroupAdmin
 from voice_bot.audio import BoundedFile
+from voice_bot.deduplication import voice_keys
 from voice_bot.errors import ProviderError, UserFacingError
+from voice_bot.groups import GroupStore
 from voice_bot.handlers import build_router
 from voice_bot.service import VoiceService, conversation_position, summary_context
+
+
+def approved_group(service, tmp_path, mode="auto"):
+    store = GroupStore(tmp_path / "groups.json")
+    group, _ = store.observe(-100, "Test")
+    store.mark_notified(group)
+    group = store.decide(-100, group.revision, "allowed")
+    store.set_mode(-100, group.revision, mode)
+    service.admin = GroupAdmin(service.settings, store)
+    return store
+
+
+def personal_voice(user_id, *, command_id=900):
+    message = identified_message(42)
+    message.chat = SimpleNamespace(id=-100, type="supergroup", title="Test")
+    message.receiver_user = User(id=user_id, is_bot=False, first_name="Reader")
+    caller = identified_message(command_id, author=user_id)
+    caller.chat = message.chat
+    caller.receiver_user = message.receiver_user
+    caller.ephemeral_message_id = command_id
+    message.ephemeral_message_id = None
+    return message, caller
+
+
+@pytest.mark.parametrize("forwarded", [False, True])
+async def test_quiet_mode_does_no_automatic_work(settings, tmp_path, forwarded):
+    service, bot, _ = make_dependencies(settings)
+    approved_group(service, tmp_path, "quiet")
+    message = identified_message(1, forwarded=forwarded)
+    message.chat = SimpleNamespace(id=-100, type="supergroup", title="Test")
+    await service.accept(message, bot)
+    await service.close()
+    bot.get_file.assert_not_awaited()
+    message.answer.assert_not_awaited()
+    service.transcriber.transcribe.assert_not_awaited()
+    assert not service.processed.records
+
+
+async def test_two_readers_receive_separate_private_results_reusing_models(settings, tmp_path):
+    service, bot, _ = make_dependencies(settings)
+    approved_group(service, tmp_path, "quiet")
+    deliveries = [personal_voice(user_id) for user_id in (111, 222)]
+    for message, caller in deliveries:
+        await service.enqueue(message, bot, requester=caller)
+    await service.close()
+    service.transcriber.transcribe.assert_awaited_once()
+    service.summarizer.summarize.assert_awaited_once()
+    bot.copy_message.assert_not_awaited()
+    for message, _ in deliveries:
+        call = message.answer.await_args
+        assert (
+            call.kwargs["ephemeral_message_parameters"].receiver_user_id == message.receiver_user.id
+        )
+        assert call.kwargs["reply_parameters"].message_id == 42
+        assert not service.processed.reply_ids(message)
+    first, second = (item[0] for item in deliveries)
+    assert voice_keys(first) != voice_keys(second)
+    assert voice_keys(first, scoped=False) == voice_keys(second, scoped=False)
+
+
+async def test_repeated_private_request_redelivers_without_copy_or_paid_calls(settings, tmp_path):
+    service, bot, _ = make_dependencies(settings)
+    approved_group(service, tmp_path)
+    first, caller = personal_voice(111)
+    # An earlier public result must never be copied into the personal delivery path.
+    public = identified_message(42)
+    public.chat = first.chat
+    await service.processed.complete([public], (1234,))
+    for command_id in (900, 901):
+        message, caller = personal_voice(111, command_id=command_id)
+        assert await service._claim(message, caller)
+        await service._handle_reserved_messages([message], bot)
+        message.answer.assert_awaited_once()
+        assert (
+            message.answer.await_args.kwargs["ephemeral_message_parameters"].receiver_user_id == 111
+        )
+    service.transcriber.transcribe.assert_awaited_once()
+    service.summarizer.summarize.assert_awaited_once()
+    bot.copy_message.assert_not_awaited()
+    assert service.processed.reply_ids(public) == (1234,)
+    assert not service.processed.reply_ids(first)
+
+
+async def test_reused_ephemeral_command_id_still_receives_new_result(settings, tmp_path):
+    service, bot, _ = make_dependencies(settings)
+    approved_group(service, tmp_path)
+    for seconds in (0, 60):
+        message, caller = personal_voice(111)
+        caller.date += timedelta(seconds=seconds)
+        assert await service._claim(message, caller)
+        await service._handle_reserved_messages([message], bot)
+        message.answer.assert_awaited_once()
+    service.transcriber.transcribe.assert_awaited_once()
+
+
+async def test_long_private_transcript_keeps_all_parts_private(settings, tmp_path):
+    from voice_bot.rendering import render_replies
+
+    service, bot, _ = make_dependencies(settings)
+    approved_group(service, tmp_path, "quiet")
+    transcript = "  начало\n\n" + "слово <&>  \n" * 1000 + "\n конец  "
+    service.transcriber.transcribe.return_value = transcript
+    message, caller = personal_voice(111)
+    assert await service._claim(message, caller)
+    await service._handle_reserved_messages([message], bot)
+    calls = message.answer.await_args_list
+    assert len(calls) > 1
+    assert [call.args[0] for call in calls] == render_replies("Кратко.", transcript)
+    assert all(
+        call.kwargs["ephemeral_message_parameters"].receiver_user_id == 111 for call in calls
+    )
+
+
+async def test_private_delivery_rejection_never_retries_publicly(settings, tmp_path, caplog):
+    service, bot, _ = make_dependencies(settings)
+    approved_group(service, tmp_path)
+    message, caller = personal_voice(111)
+    message.answer.side_effect = TelegramBadRequest(
+        method=SendMessage(chat_id=-100, text="SECRET"), message="SECRET delivery denied"
+    )
+    assert await service._claim(message, caller)
+    await service._handle_reserved_messages([message], bot)
+    message.answer.assert_awaited_once()
+    assert message.answer.await_args.kwargs["ephemeral_message_parameters"].receiver_user_id == 111
+    bot.copy_message.assert_not_awaited()
+    assert "SECRET" not in caplog.text
+
+
+async def test_private_errors_for_different_readers_are_not_suppressed(settings):
+    service, _, _ = make_dependencies(settings)
+    for user_id in (111, 222):
+        _, caller = personal_voice(user_id)
+        await service.notify(caller, "Ошибка запроса.")
+        caller.answer.assert_awaited_once()
+        assert (
+            caller.answer.await_args.kwargs["ephemeral_message_parameters"].receiver_user_id
+            == user_id
+        )
+
+
+async def test_switching_to_quiet_during_processing_stops_public_delivery(settings, tmp_path):
+    service, bot, _ = make_dependencies(settings)
+    store = approved_group(service, tmp_path)
+
+    async def transcribe(_):
+        group = store.groups[-100]
+        store.set_mode(-100, group.revision, "quiet")
+        return "Результат после переключения режима."
+
+    service.transcriber.transcribe.side_effect = transcribe
+    message = identified_message(42)
+    message.chat = SimpleNamespace(id=-100, type="supergroup", title="Test")
+    await service.handle(message, bot)
+    message.answer.assert_not_awaited()
+    service.summarizer.summarize.assert_not_awaited()
+
+
+@pytest.mark.parametrize("ephemeral_command", [False, True])
+async def test_group_text_routes_to_requester_not_voice_author(
+    settings, monkeypatch, ephemeral_command
+):
+    service, _, _ = make_dependencies(settings)
+    service.enqueue = AsyncMock()
+    monkeypatch.setattr(
+        Bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="administrator"))
+    )
+    dispatcher = Dispatcher()
+    dispatcher.include_router(build_router(service))
+    chat = {"id": -100, "type": "supergroup", "title": "Test"}
+    command = {
+        "message_id": 0 if ephemeral_command else 43,
+        "ephemeral_message_id": 999 if ephemeral_command else None,
+        "date": 0,
+        "chat": chat,
+        "from": {"id": 111, "is_bot": False, "first_name": "Reader"},
+        "text": "/text",
+        "reply_to_message": {
+            "message_id": 42,
+            "date": 0,
+            "chat": chat,
+            "from": {"id": 222, "is_bot": False, "first_name": "Author"},
+            "voice": {"file_id": "id", "file_unique_id": "unique", "duration": 30},
+        },
+    }
+    async with Bot(token="123456:TEST_TOKEN") as bot:
+        await dispatcher.feed_update(
+            bot, Update.model_validate({"update_id": 1, "message": command})
+        )
+    original, _ = service.enqueue.await_args.args
+    assert original.message_id == 42 and original.from_user.id == 222
+    assert original.receiver_user.id == 111
+    assert service.enqueue.await_args.kwargs["requester"].receiver_user.id == 111
+
+
+async def test_anonymous_group_text_cannot_trigger_public_output(settings):
+    service, _, _ = make_dependencies(settings)
+    service.enqueue = AsyncMock()
+    service.send = AsyncMock()
+    dispatcher = Dispatcher()
+    dispatcher.include_router(build_router(service))
+    async with Bot(token="123456:TEST_TOKEN") as bot:
+        await dispatcher.feed_update(
+            bot,
+            Update.model_validate(
+                {
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 43,
+                        "date": 0,
+                        "text": "/text",
+                        "chat": {"id": -100, "type": "supergroup", "title": "Test"},
+                        "sender_chat": {"id": -100, "type": "supergroup", "title": "Test"},
+                        "from": {"id": 1087968824, "is_bot": True, "first_name": "Anonymous"},
+                    },
+                }
+            ),
+        )
+    service.enqueue.assert_not_awaited()
+    service.send.assert_not_awaited()
 
 
 def make_message(*, duration=30, size=100, chat_id=123):
@@ -433,7 +655,10 @@ async def test_text_command_processes_original_voice_and_replies_to_it(settings)
     assert handled.await_args.args[0].from_user.id == 222
 
 
-async def test_text_command_accepts_external_voice_in_same_chat(settings):
+async def test_text_command_accepts_external_voice_in_same_chat(settings, monkeypatch):
+    monkeypatch.setattr(
+        Bot, "get_chat_member", AsyncMock(return_value=SimpleNamespace(status="administrator"))
+    )
     service, _, _ = make_dependencies(settings)
     handled = AsyncMock()
 
@@ -452,6 +677,7 @@ async def test_text_command_accepts_external_voice_in_same_chat(settings):
                     "date": 0,
                     "text": "/text",
                     "chat": {"id": -100, "type": "supergroup", "title": "Test"},
+                    "from": {"id": 111, "is_bot": False, "first_name": "Читатель"},
                     "external_reply": {
                         "origin": {
                             "type": "user",
@@ -473,6 +699,7 @@ async def test_text_command_accepts_external_voice_in_same_chat(settings):
     handled.assert_awaited_once()
     original = handled.await_args.args[0]
     assert original.message_id == 42 and original.chat.id == -100
+    assert original.receiver_user.id == 111
     assert summary_context(original).author_name == "Другой участник"
 
 
@@ -492,6 +719,7 @@ async def test_text_command_does_not_process_external_voice_from_other_chat(sett
                     "date": 0,
                     "text": "/text",
                     "chat": {"id": -100, "type": "supergroup", "title": "Test"},
+                    "from": {"id": 111, "is_bot": False, "first_name": "Читатель"},
                     "external_reply": {
                         "origin": {"type": "hidden_user", "date": 0, "sender_user_name": "Автор"},
                         "chat": {"id": -200, "type": "supergroup", "title": "Other"},

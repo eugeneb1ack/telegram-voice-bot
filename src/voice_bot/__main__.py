@@ -10,13 +10,15 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramAPIError
 from aiogram.methods import GetUpdates
-from aiogram.types import BotCommand, BotCommandScopeChat
+from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeChat
 from pydantic import ValidationError
 
 from voice_bot.admin import GroupAdmin, build_admin_router
+from voice_bot.commands import CommandCleanup
 from voice_bot.config import Settings
 from voice_bot.groups import GroupStore
 from voice_bot.handlers import build_router
+from voice_bot.modes import build_modes_router
 from voice_bot.providers import APIClient, HTTPSummarizer, HTTPTranscriber
 from voice_bot.service import VoiceService
 
@@ -48,14 +50,32 @@ async def run(settings: Settings) -> None:
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="Добавить бота в группу"),
-                BotCommand(command="text", description="Расшифровать голосовое в ответе"),
+                BotCommand(
+                    command="text", description="Расшифровать только для меня", is_ephemeral=True
+                ),
             ]
+        )
+        await bot.set_my_commands(
+            [
+                BotCommand(
+                    command="text", description="Расшифровать только для меня", is_ephemeral=True
+                ),
+                BotCommand(
+                    command="settings", description="Выбрать режим работы", is_ephemeral=True
+                ),
+                BotCommand(command="start", description="О боте"),
+            ],
+            scope=BotCommandScopeAllGroupChats(),
         )
         try:
             await bot.set_my_commands(
                 [
                     BotCommand(command="start", description="Добавить бота в группу"),
-                    BotCommand(command="text", description="Расшифровать голосовое в ответе"),
+                    BotCommand(
+                        command="text",
+                        description="Расшифровать только для меня",
+                        is_ephemeral=True,
+                    ),
                 ],
                 scope=BotCommandScopeChat(chat_id=settings.owner_id),
             )
@@ -72,7 +92,10 @@ async def run(settings: Settings) -> None:
             api = APIClient(client, settings)
             service = VoiceService(settings, HTTPTranscriber(api), HTTPSummarizer(api), admin=admin)
             dispatcher = Dispatcher()
+            cleanup = CommandCleanup(max_pending=settings.max_pending_jobs)
+            dispatcher.message.middleware(cleanup)
             dispatcher.include_router(build_admin_router(admin))
+            dispatcher.include_router(build_modes_router(admin))
             dispatcher.include_router(build_router(service))
             await admin.notify_pending(bot)
             logger.info(
@@ -89,7 +112,10 @@ async def run(settings: Settings) -> None:
                     close_bot_session=False,
                 )
             finally:
-                await service.close()
+                try:
+                    await service.close()
+                finally:
+                    await cleanup.close()
 
 
 def main() -> None:

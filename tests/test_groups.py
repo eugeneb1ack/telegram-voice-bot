@@ -27,6 +27,7 @@ def test_decisions_survive_restart_and_unknown_groups_fail_closed(tmp_path):
         "present",
         "revision",
         "notified",
+        "mode",
     }
 
 
@@ -80,3 +81,29 @@ def test_repeating_same_decision_does_not_rewrite_state_or_increment_revision(tm
         same = store.decide(-100, group.revision, "allowed")
     replace.assert_not_called()
     assert same == group and store.path.read_bytes() == before
+
+
+def test_legacy_groups_default_to_auto_and_modes_survive_restart(tmp_path):
+    path = tmp_path / "groups.json"
+    path.write_text('[{"chat_id":-100,"title":"Test","status":"allowed"}]')
+    store = GroupStore(path)
+    assert store.automatic(-100)
+    group = store.set_mode(-100, 1, "quiet")
+    assert group.mode == "quiet" and group.revision == 2
+    assert not GroupStore(path).automatic(-100)
+    assert GroupStore(path).allowed(-100)
+    assert store.set_mode(-100, 1, "auto") is None
+    assert not store.automatic(-100)
+    store.leave(-100)
+    assert store.set_mode(-100, 3, "auto") is None
+    group, _ = store.observe(-100, "Test")
+    assert group.mode == "quiet" and group.status == "pending"
+
+
+def test_mode_disk_failure_keeps_old_mode(tmp_path):
+    store = GroupStore(tmp_path / "groups.json")
+    group, _ = store.observe(-100, "Test")
+    with patch("voice_bot.groups.os.replace", side_effect=OSError):
+        with pytest.raises(OSError):
+            store.set_mode(-100, group.revision, "quiet")
+    assert store.automatic(-100) and GroupStore(store.path).automatic(-100)
