@@ -733,6 +733,17 @@ class VoiceService:
         if cached is not None:
             return ReplyContext(**json.loads(cached))
         kind = media_kind(target)
+        previous = self.memory.reply_source(message.chat.id, target.message_id)
+        if kind != "text" and previous is not None and previous.kind == kind:
+            author = summary_context(target)
+            context = replace(
+                previous,
+                message_id=message.message_id,
+                author_name=author.author_name,
+                author_username=author.author_username,
+            )
+            self._result_put(cache_key, json.dumps(asdict(context), ensure_ascii=False))
+            return context
         caption = getattr(target, "text", None) or getattr(target, "caption", None) or ""
         source = caption if kind == "text" else ""
         unavailable = None

@@ -337,3 +337,35 @@ def test_legacy_reply_without_author_or_privacy_metadata_is_not_reused():
     target = foreign_message().model_copy(update={"from_user": None})
     message = reply_voice(target=target)
     assert reply_target(message) is None
+
+
+async def test_saved_media_reply_source_is_reused_for_new_reply_after_restart(settings):
+    service, bot, _ = setup(settings)
+    target = foreign_message(kind="video")
+    first = reply_voice(10, target)
+    service.transcriber.transcribe.return_value = FOREIGN_TEXT
+    reference = await service._reply_context(first, bot)
+    assert reference is not None and reference.text == FOREIGN_TEXT
+    service.transcriber.transcribe.assert_awaited_once()
+    service.memory.remember(
+        (-100, 0, 222),
+        first.date.timestamp(),
+        (first.message_id,),
+        "Собственная мысль 10.",
+        reply_contexts=(reference,),
+    )
+    await service.memory.checkpoint()
+    await service.close()
+    restarted, bot, _ = setup(settings)
+    try:
+        second = reply_voice(11, foreign_message(kind="video"))
+        recovered = await restarted._reply_context(second, bot)
+        assert recovered is not None and recovered.text == FOREIGN_TEXT
+        assert recovered.message_id == 11 and recovered.reply_to_message_id == 1
+        assert recovered.author_name == "Ирина" and recovered.author_username == "irina"
+        assert recovered.kind == "video" and recovered.unavailable_reason is None
+        restarted.transcriber.transcribe.assert_not_awaited()
+        bot.get_file.assert_not_awaited()
+        bot.download_file.assert_not_awaited()
+    finally:
+        await restarted.close()

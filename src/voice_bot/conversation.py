@@ -146,6 +146,20 @@ class ConversationMemory:
                         return entry.text
         return None
 
+    def reply_source(self, chat_id: int, message_id: int) -> ReplyContext | None:
+        self.purge()
+        for key, session in reversed(self.sessions.items()):
+            if key[0] == chat_id:
+                for entry in reversed(session.entries):
+                    for context in entry.reply_contexts:
+                        if (
+                            context.reply_to_message_id == message_id
+                            and context.text
+                            and not context.unavailable_reason
+                        ):
+                            return context
+        return None
+
     def remember(
         self,
         key: ConversationKey | None,
