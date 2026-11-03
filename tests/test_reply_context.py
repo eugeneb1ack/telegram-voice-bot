@@ -1,11 +1,12 @@
 """Explicit reply sources enrich summaries without becoming the author's speech."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
 from aiogram.types import Message, User
 from test_conversation_scope import scoped_voice
+from test_rendering import ParsedReply
 from test_service import make_dependencies
 
 from voice_bot.journal import pack
@@ -81,6 +82,76 @@ async def test_first_voice_reply_reaches_third_summary_without_becoming_own_spee
         assert [entry.text for entry in entries] == [
             f"Собственная мысль {number}." for number in (10, 11, 12)
         ]
+    finally:
+        await service.close()
+
+
+async def test_continuous_own_text_series_survives_total_span_over_gap_without_foreign_ambient(
+    settings,
+):
+    service, bot, _ = setup(settings)
+    started = datetime(2026, 1, 1, tzinfo=UTC)
+    own_texts = (
+        "У Sony удобная рукоятка.",
+        "Эту камеру приятно держать даже с тяжёлым объективом.",
+        "Мне важнее удобство хвата, чем компактность корпуса.",
+    )
+    foreign_ambient = "Ирина купила велосипед для поездок по городу."
+    target_text = "Интересно, что на нём, если включить?"
+    target = foreign_message().model_copy(update={"text": target_text})
+    voice_texts = (
+        "  В прошлом году достал Nokia из пруда.\nНу его, мало ли чья информация.  ",
+        "  Раз, два, три, четыре.\n",
+        "Раз, два, три, четыре.  ",
+    )
+    try:
+        # The author's whole series spans 390 seconds, but no adjacent gap exceeds 120.
+        for number, seconds, words in zip((10, 11, 12), (0, 120, 240), own_texts, strict=True):
+            message = scoped_voice(number)
+            message.date = started + timedelta(seconds=seconds)
+            message.voice = None
+            message.text = words
+            await service.observe_text(message)
+        other = scoped_voice(13)
+        other.date = started + timedelta(seconds=270)
+        other.from_user = User(id=444, is_bot=False, first_name="Ирина")
+        other.voice = None
+        other.text = foreign_ambient
+        await service.observe_text(other)
+
+        for number, seconds, words in zip((20, 21, 22), (360, 375, 390), voice_texts, strict=True):
+            message = reply_voice(number, target if number == 20 else None)
+            message.date = started + timedelta(seconds=seconds)
+            service.transcriber.transcribe.return_value = words
+            await service.handle(message, bot)
+            message.answer.assert_awaited_once()
+            reply = message.answer.await_args.args[0]
+            assert ParsedReply(reply).transcript == words
+            assert ("Коротко · 3 голосовых:" in reply) == (number == 22)
+            assert service.summarizer.summarize.await_count == int(number == 22)
+
+        call = service.summarizer.summarize.await_args
+        source = call.args[0]
+        context = call.kwargs["context"]
+        assert all(words in source for words in (*own_texts, *voice_texts))
+        assert [source.index(words) for words in own_texts] == sorted(
+            source.index(words) for words in own_texts
+        )
+        assert context.author_name == "Имя 222" and context.author_source == "sender"
+        assert context.is_conversation
+        assert foreign_ambient not in source and target_text not in source
+        assert all(foreign_ambient not in words for words in context.recent_summaries)
+        assert [
+            (ref.message_id, ref.reply_to_message_id, ref.text) for ref in context.reply_contexts
+        ] == [(20, 1, target_text)]
+        assert context.reply_contexts[0].author_name == "Ирина"
+        assert "Голосовое (message_id=20):" in source
+        assert [entry.text for entry in service.memory.sessions[(-100, 0, 222)].entries] == [
+            *own_texts,
+            *voice_texts,
+        ]
+        service.transcriber.transcribe.assert_awaited()
+        assert service.transcriber.transcribe.await_count == 3
     finally:
         await service.close()
 
