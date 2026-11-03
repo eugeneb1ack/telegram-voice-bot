@@ -13,12 +13,13 @@ import httpx
 from voice_bot.config import Settings
 from voice_bot.errors import ProviderError
 from voice_bot.reply_context import ReplyContext
+from voice_bot.stt_context import bounded_keywords
 
 logger = logging.getLogger(__name__)
 
 
 class Transcriber(Protocol):
-    async def transcribe(self, audio: Path) -> str: ...
+    async def transcribe(self, audio: Path, *, keywords: tuple[str, ...] = ()) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -178,9 +179,12 @@ class HTTPTranscriber:
     def __init__(self, api: APIClient) -> None:
         self.api = api
 
-    async def transcribe(self, audio: Path) -> str:
+    async def transcribe(self, audio: Path, *, keywords: tuple[str, ...] = ()) -> str:
         settings = self.api.settings
-        payload = {"model": settings.stt_model, "response_format": "json"}
+        payload: dict[str, Any] = {"model": settings.stt_model, "response_format": "json"}
+        hints = bounded_keywords(keywords)
+        if settings.stt_model == "gpt-transcribe" and hints:
+            payload["keywords[]"] = list(hints)
         if settings.stt_language:
             language_field = "languages[]" if settings.stt_model == "gpt-transcribe" else "language"
             payload[language_field] = settings.stt_language
@@ -225,8 +229,11 @@ class HTTPSummarizer:
             "не критический разбор: спорные тезисы передавай как мнение автора без своих оценок. "
             "Ругань, оскорбления, извинения и обращения без самостоятельного смысла "
             "опускай полностью, включая комментарии о том, что они прозвучали. "
-            "В первом предложении естественно используй @никнейм из context.author_username, "
-            "иначе context.author_name, иначе «Автор». Отдельную строку об авторе не добавляй. "
+            "В первом предложении естественно используй имя из context.author_name; "
+            "только если имя отсутствует или пустое — @никнейм из context.author_username; "
+            "если нет и никнейма — «Автор». Тот же приоритет действует для авторов "
+            "в voices и reply_contexts: при наличии имени никнейм не добавляй. "
+            "Отдельную строку об авторе не добавляй. "
             "Для пересылок используй исходного автора; авторы отдельных записей указаны "
             "в voices. При author_source=multiple различай участников, не приписывай всё одному. "
             "is_forwarded описывает доставку записи: из этого признака не следует, "

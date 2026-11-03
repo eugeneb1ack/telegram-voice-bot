@@ -69,6 +69,30 @@ source snapshot, not a recursive reply history. Summary prompts distinguish the 
 question/proposal, the author's response/clarification and the actual outcome, without
 adding decisions, unnecessary sections or filler.
 
+## Spelling hints during transcription
+
+`gpt-transcribe` receives up to 16 literal vocabulary hints (320 characters total)
+from the explicit reply, the recording's caption and up to three preceding messages
+from the same author, chat and forum topic within the 180-second series window.
+Existing voice transcripts may contribute vocabulary; source audio is never reprocessed
+just to build hints. Typed spelling takes precedence over earlier speech recognition.
+Only available text is used: an unrecognized referenced recording is not downloaded
+for this step. Ordinary attachments contribute captions only.
+
+Hints contain bounded individual words with capitalization, without usernames, URLs,
+whole messages or conversational instructions. They use the dedicated `keywords[]`
+field, not a transcript-rewriting pass. The returned transcript and whitespace stay
+unchanged. A cached transcript is reused as-is; the hint list is checkpointed with a
+pending job so a restart cannot change an in-flight request's context. Private `/text`
+does not read ambient history. Disabling context disables these hints. Other configured
+STT models keep their existing request format.
+
+Hints can reduce spelling errors but cannot guarantee error-free recognition or the
+absence of invented words. Only words actually spoken should appear; evaluate both
+relevant names and unrelated/conflicting audio. Summary displays the author's name
+first, with `@username` only when no name is available. Forwarded messages retain their
+original author.
+
 ## Durable queue
 
 Accepted voices, including forwarded voices still being collected, survive process
