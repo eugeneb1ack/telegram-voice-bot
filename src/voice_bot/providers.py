@@ -439,6 +439,10 @@ class HTTPSummarizer:
                 raise ProviderError("Не удалось получить сводку по веткам диалога.") from None
             parts: list[str] = []
             if recap := sections.get("recap", "").strip():
+                for prefix in ("ранее:", "ранее "):
+                    if recap.lower().startswith(prefix):
+                        recap = recap[len(prefix) :].lstrip()
+                        break
                 parts.append(f"Ранее: {recap}")
             for branch in dialogue.branches:
                 body = sections[branch.branch_id].strip()

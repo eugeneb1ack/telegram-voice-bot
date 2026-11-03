@@ -296,7 +296,7 @@ async def test_structured_summary_exact_branches_and_deterministic_names(
             else {"b3": "Про бота.", "b2": "Про девушку.", "b1": "Вопрос про кота."}
         )
         if previous and invalid is None:
-            answer["recap"] = "Обсуждали поездку с котом."
+            answer["recap"] = "Ранее: Обсуждали поездку с котом."
         return httpx.Response(
             200,
             json={
