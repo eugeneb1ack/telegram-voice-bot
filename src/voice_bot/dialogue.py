@@ -44,6 +44,8 @@ class DialogueContext:
         transcript: str,
         duration_seconds: int,
         reply_contexts: tuple[ReplyContext, ...] = (),
+        *,
+        force: bool = False,
     ) -> DialogueInput | None:
         self.memory.purge()
         every = self.settings.context_summary_every
@@ -66,7 +68,9 @@ class DialogueContext:
             )
             series.covered_count = max(series.covered_count or 0, series.summarized_count)
         count = series.voice_count + int(message_id > series.counted_through)
-        if count - series.summarized_count < every:
+        if count - series.summarized_count < every and not (
+            force and series.voice_count > (series.covered_count or 0)
+        ):
             return None
         previous = [
             e
@@ -87,7 +91,6 @@ class DialogueContext:
         voices = [e for e in sources if e.kind == "voice"]
         new_count = count - (series.covered_count or 0)
         partial = len(voices) < new_count or any(e.text.endswith("…") for e in sources)
-        count -= series.summary_offset
         background = tuple(e.summary or e.text for e in previous if e not in sources)
         references = bounded_contexts(
             tuple(context for entry in sources for context in entry.reply_contexts),
