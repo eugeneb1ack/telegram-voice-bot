@@ -30,7 +30,7 @@ from voice_bot.config import Settings
 from voice_bot.conversation import Anchor, ConversationKey, ConversationMemory, Session
 from voice_bot.deduplication import ProcessedVoices, RecentResults, voice_keys
 from voice_bot.delivery import ephemeral, recipient, reply_to
-from voice_bot.dialogue import DialogueSummaries
+from voice_bot.dialogue import DialogueContext, DialogueInput
 from voice_bot.errors import ProviderError, UserFacingError
 from voice_bot.jobs import VoiceJobQueue
 from voice_bot.limits import NoticeLimiter, SenderKey, sender_key
@@ -134,7 +134,6 @@ class VoiceService:
         self._owners: dict[str, SenderKey] = {}
         self._pending_by_sender: Counter[SenderKey] = Counter()
         self._requesters: dict[str, Message] = {}
-        self._context_owners: dict[str, tuple[ConversationKey, int]] = {}
         self._capacity = asyncio.Semaphore(settings.max_concurrent_jobs)
         self.memory = ConversationMemory(
             settings.context_ttl_seconds,
@@ -143,17 +142,7 @@ class VoiceService:
             max_entries=settings.context_max_messages,
             path=settings.context_state_file,
         )
-        self.dialogue = DialogueSummaries(
-            self.memory,
-            settings,
-            summarizer,
-            self._capacity,
-            lambda key, target: any(
-                owner == key and message_id <= target
-                for owner, message_id in self._context_owners.values()
-            ),
-            self._context_allowed,
-        )
+        self.dialogue = DialogueContext(self.memory, settings, self._context_allowed)
         self.batcher = VoiceBatcher(
             self._enqueue_batch,
             settings.voice_batch_pause_seconds,
@@ -176,7 +165,7 @@ class VoiceService:
         return True
 
     def start(self, bot: Bot) -> None:
-        self.dialogue.start(bot)
+        self.dialogue.start()
 
     async def observe_text(self, message: Message) -> None:
         text = getattr(message, "text", None)
@@ -247,7 +236,6 @@ class VoiceService:
 
     def _release(self, message: Message, *, failed: bool = False) -> None:
         key = voice_keys(message)[0]
-        self._context_owners.pop(key, None)
         actor = self._owners.pop(key, None)
         if actor is not None:
             self._pending_by_sender[actor] -= 1
@@ -303,10 +291,6 @@ class VoiceService:
             accepted = bool(self.processed.reply_ids(message)) or await self._charge_private(
                 message
             )
-            position = conversation_position(message)
-            if accepted and position is not None:
-                context_key = position[0]
-                self._context_owners[voice_keys(message)[0]] = (context_key, message.message_id)
             return accepted
         except OSError:
             logger.error("private_quota_storage_unavailable")
@@ -417,7 +401,6 @@ class VoiceService:
         self._quota_charged.clear()
         self._sent_ids.clear()
         self.results.clear()
-        self._context_owners.clear()
 
     async def _handle_messages(self, messages: list[Message], bot: Bot) -> None:
         claimed = [message for message in messages if await self._claim(message)]
@@ -601,6 +584,7 @@ class VoiceService:
             if needs_summary
             else None
         )
+        dialogue: DialogueInput | None = None
         transcripts: list[str | None] = [None] * len(messages)
         failures = ["Не обработано: превышено время ожидания."] * len(messages)
         try:
@@ -627,12 +611,34 @@ class VoiceService:
                 if not self.work_allowed(message):
                     return []
                 transcript = self._joined(transcripts, failures)
+                summary_input = transcript
+                if not is_batch and transcripts[0] is not None:
+                    dialogue = self.dialogue.prepare(
+                        key,
+                        min(times) if times else 0,
+                        message.message_id,
+                        transcript,
+                        message.voice.duration,
+                    )
+                    if dialogue is not None:
+                        needs_summary = True
+                        summary_input = dialogue.text
+                        summary = (
+                            "Не удалось составить краткое содержание. Полная расшифровка ниже."
+                        )
                 if needs_summary and any(part is not None for part in transcripts):
                     context = summary_context(messages[0])
                     context = replace(
                         context,
                         recent_summaries=self.memory.recent(key, min(times) if times else 0, ids),
                     )
+                    if dialogue is not None:
+                        context = replace(
+                            context,
+                            recent_summaries=dialogue.background,
+                            duration_seconds=dialogue.duration_seconds,
+                            is_conversation=True,
+                        )
                     if is_batch:
                         authors = [summary_context(item) for item in messages]
                         same_author = all(
@@ -658,7 +664,7 @@ class VoiceService:
                             "summary:"
                             + ":".join(voice_keys(item, scoped=False)[0] for item in messages)
                             + ":"
-                            + hashlib.sha256(transcript.encode()).hexdigest()
+                            + hashlib.sha256(summary_input.encode()).hexdigest()
                             + ":"
                             + hashlib.sha256(
                                 json.dumps(asdict(context), sort_keys=True).encode()
@@ -667,7 +673,7 @@ class VoiceService:
                         cached_summary = self.results.get(cache_key)
                         if cached_summary is None:
                             cached_summary = await self.summarizer.summarize(
-                                transcript, context=context
+                                summary_input, context=context
                             )
                             self.results.put(cache_key, cached_summary)
                         summary = cached_summary
@@ -685,7 +691,15 @@ class VoiceService:
             summary = "Не удалось распознать записи. Причины указаны в общей расшифровке."
         elif is_batch and any(part is None for part in transcripts):
             summary = "Часть записей не обработана.\n\n" + (summary or "")
-        sent_ids = await self._send_result(message, bot, summary, transcript, len(messages))
+        title = f"Коротко · {dialogue.voice_count} голосовых:" if dialogue else "Коротко:"
+        sent_ids = await self._send_result(
+            message,
+            bot,
+            summary,
+            transcript,
+            len(messages),
+            summary_title=title,
+        )
         if sent_ids is None:
             return []
         self._sent_ids[voice_keys(message)[0]] = sent_ids
@@ -707,6 +721,8 @@ class VoiceService:
                 if not is_batch
                 else None,
             )
+            if dialogue is not None and key is not None and key in self.memory.sessions:
+                self.memory.sessions[key].summarized_through = message.message_id
             await self.memory.checkpoint()
         return [item for item, text in zip(messages, transcripts, strict=True) if text is not None]
 
@@ -721,7 +737,14 @@ class VoiceService:
         )
 
     async def _send_result(
-        self, message: Message, bot: Bot, summary: str | None, transcript: str, count: int
+        self,
+        message: Message,
+        bot: Bot,
+        summary: str | None,
+        transcript: str,
+        count: int,
+        *,
+        summary_title: str = "Коротко:",
     ) -> tuple[int, ...] | None:
         content_hash = hashlib.sha256(((summary or "") + "\0" + transcript).encode()).hexdigest()
         delivery_key = "delivery:" + voice_keys(message)[0] + ":" + content_hash
@@ -733,7 +756,13 @@ class VoiceService:
                 f":{requester.date.timestamp()}"
             )
         if count == 1:
-            return await self._send_text_result(message, summary, transcript, delivery_key)
+            return await self._send_text_result(
+                message,
+                summary,
+                transcript,
+                delivery_key,
+                summary_title=summary_title,
+            )
         if self.results.get("fallback:" + delivery_key) is None:
             try:
                 for attempt in range(2):
@@ -768,12 +797,20 @@ class VoiceService:
         return await self._send_text_result(message, summary, transcript, delivery_key)
 
     async def _send_text_result(
-        self, message: Message, summary: str | None, transcript: str, delivery_key: str
+        self,
+        message: Message,
+        summary: str | None,
+        transcript: str,
+        delivery_key: str,
+        *,
+        summary_title: str = "Коротко:",
     ) -> tuple[int, ...] | None:
         sent_parts = int(self.results.get(delivery_key) or "0")
         ids_key = "ids:" + delivery_key
         sent_ids: list[int] = json.loads(self.results.get(ids_key) or "[]")
-        for index, reply in enumerate(render_replies(summary, transcript)):
+        for index, reply in enumerate(
+            render_replies(summary, transcript, summary_title=summary_title)
+        ):
             if index < sent_parts:
                 continue
             if not self.work_allowed(message):

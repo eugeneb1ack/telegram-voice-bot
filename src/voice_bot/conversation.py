@@ -42,7 +42,7 @@ class Session:
     entries: list[Entry] = field(default_factory=list)
     summarized_through: int = 0
     anchor: Anchor | None = None
-    # Persisted before sending: an ambiguous Telegram delivery is never replayed on restart.
+    # Legacy watermark from separate-message summaries, retained for snapshot compatibility.
     claimed_through: int = 0
 
 

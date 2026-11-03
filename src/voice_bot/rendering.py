@@ -69,7 +69,9 @@ def split_text(text: str, limit: int = CONTENT_LIMIT) -> list[str]:
     return chunks
 
 
-def render_replies(summary: str | None, transcript: str) -> list[str]:
+def render_replies(
+    summary: str | None, transcript: str, *, summary_title: str = "Коротко:"
+) -> list[str]:
     transcript_parts = split_text(transcript)
     if summary is None:
         return [
@@ -78,13 +80,13 @@ def render_replies(summary: str | None, transcript: str) -> list[str]:
         ]
     summary_parts = split_text(summary)
     # Usual voice note: one reply containing summary + collapsible full transcription.
-    combined_plain = f"Коротко:\n{summary}\n\nРасшифровка:\n{transcript}"
+    combined_plain = f"{summary_title}\n{summary}\n\nРасшифровка:\n{transcript}"
     if utf16_length(combined_plain) <= MESSAGE_LIMIT:
         return [
-            f"<b>Коротко:</b>\n{escape(summary)}\n\n"
+            f"<b>{escape(summary_title)}</b>\n{escape(summary)}\n\n"
             f"<blockquote expandable><b>Расшифровка:</b>\n{escape(transcript)}</blockquote>"
         ]
-    replies = [f"<b>Коротко:</b>\n{escape(part)}" for part in summary_parts]
+    replies = [f"<b>{escape(summary_title)}</b>\n{escape(part)}" for part in summary_parts]
     for index, part in enumerate(transcript_parts, 1):
         replies.append(
             f"<blockquote expandable><b>Расшифровка ({index}/{len(transcript_parts)}):</b>\n"
