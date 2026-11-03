@@ -3,7 +3,7 @@
 from dataclasses import asdict
 from typing import Any
 
-from voice_bot.dialogue_graph import SharedDialogue
+from voice_bot.dialogue_graph import SharedDialogue, leading_person
 from voice_bot.errors import ProviderError
 
 DIALOGUE_INSTRUCTIONS = (
@@ -12,12 +12,23 @@ DIALOGUE_INSTRUCTIONS = (
     "только справка для непонятной отсылки. Они уже разделены приложением. "
     "Верни JSON со строкой для каждого branch_id. Пересказывай только primary_messages "
     "этой ветки. Сохрани существенную мысль каждой записи, вопросы и оговорки. "
-    "Пиши от первого лица основного автора: «люблю слушать», «не умею играть», "
-    "«спрашиваю, когда встреча». Это пересказ, не прямая цитата. "
-    "Имя автора и адресата подпишет приложение; не добавляй их заголовки в текст. "
+    "Пиши от третьего лица как рассказчик: «Любит слушать джаз, но играть не умеет», "
+    "«Живёт в Петербурге и предлагает передать привет родным собеседника». "
+    "Не имитируй речь автора от первого лица. Не начинай с «рассказывает, что», "
+    "«говорит, что», «спрашивает» ради отчёта о разговоре: передай саму суть. "
+    "Для вопроса подходит «Интересуется, откуда собеседник». Не повторяй дословно "
+    "несколько коротких реплик: объединяй их в связный компактный пересказ. "
+    "Приложение добавит имя автора и адресата в заголовок: не дублируй его. "
+    "При переходе от другого человека к основному автору пиши «автор», чтобы не спутать лица. "
     "Не заменяй основного автора местоимениями «он/она» с неясным значением. "
-    "Когда речь действительно о другом человеке, назови его по имени из источника, "
-    "а при отсутствии имени — по username; не выдавай его слова за свои. "
+    "Когда речь о другом человеке, назови его по имени из источника, а при отсутствии "
+    "имени — по username. references в текущей реплике — проверенная связь mention "
+    "с referent из source_id: используй её, чтобы назвать человека вместо неясного «он». "
+    "Эта связь относится только к указанной реплике, не переносится на все местоимения "
+    "в остальных темах. Если референт неизвестен, напиши один раз «неназванный человек» "
+    "или «не уточняет, о ком речь», не угадывай имя и не оставляй повисшее «он». "
+    "unresolved_person обозначает речь о неназванном третьем лице, НЕ об основном авторе. "
+    "Для имени из старого фона требуется references; одна тематическая связь его не доказывает. "
     "background_messages с role=other_speaker — чужие слова, same_speaker — прежние "
     "слова основного автора. Они не становятся новыми тезисами. Используй только "
     "минимум для конкретной отсылки. Раскрой однозначные «там же», «прежний день», "
@@ -53,6 +64,7 @@ DIALOGUE_INSTRUCTIONS = (
 def dialogue_payload(dialogue: SharedDialogue, max_chars: int) -> dict[str, Any]:
     """Resolve membership in code; a foreign author can never be primary speech."""
     nodes = {m.message_id: m for m in dialogue.messages}
+    first_id = min((mid for branch in dialogue.branches for mid in branch.message_ids), default=0)
     seen: set[int] = set()
     branches = []
     size = 0
@@ -68,6 +80,11 @@ def dialogue_payload(dialogue: SharedDialogue, max_chars: int) -> dict[str, Any]
                     key: value
                     for key, value in asdict(node).items()
                     if key not in {"author_name", "author_username"}
+                }
+                | {
+                    "unresolved_person": leading_person(node.text)
+                    if mid == first_id and not node.references
+                    else None
                 }
             )
             size += len(node.text)

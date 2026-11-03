@@ -42,7 +42,7 @@ A series spans at most 7 minutes from its first voice. The counter restarts at
 that boundary: two voices followed by a third two hours later never form a triple.
 Text does not extend the boundary. `CONTEXT_SERIES_GAP_SECONDS` (default 420) can
 additionally limit silence between voices; `CONTEXT_TTL_SECONDS` caps total series
-length and ambient context age.
+length.
 
 Counters are per author, chat and actual forum topic. Background is selected by
 explicit reply ancestry: the direct target plus at most two earlier ancestors
@@ -51,20 +51,30 @@ recipient and temporal proximity alone do not establish a connection. An explici
 old source is allowed without loading its surrounding history.
 
 Without a reply, a separate bounded semantic selection precedes summary generation:
-at most 12 candidates from the same chat/topic within 7 minutes, 6,000 characters
-total. Existing transcripts, text and captions may clarify a specific reference,
+at most 12 candidates from the same chat/topic, 6,000 characters total. The search
+window covers five minutes before each primary message, rather than before the final
+summary. Source retention allows that lookback plus the seven-minute series (12 minutes
+with defaults), under the same message/character caps. This does not extend counters.
+Existing transcripts, text and captions may clarify a specific reference,
 continuation, correction or answer; a broad shared topic is insufficient. Source IDs,
 chronology and verbatim evidence quotes are validated. Ambiguous links are dropped.
 The summary request sees at most three selected sources; rejected candidates never
 reach it. Explicit replies take priority, and inferred continuity never invents a recipient.
+A person reference retains the exact mention, source ID and source-backed name for
+that primary message only. An inherited name is allowed only for a leading pronoun
+in the first primary message, from that same author’s earlier text.
+Multiple possible people, a topic switch or an unproven
+name must not be resolved by guessing. An explicit reply already selected in the
+current block can also clarify its continuation, regardless of the source's age.
 
 Before generation, the application resolves each branch into separate current-speech
 and background lists. It validates primary speakers by Telegram ID; recipient names
 are presentation labels, never speaking-role instructions. Background retains its
 own author and may clarify references without becoming new claims. The model no
-longer joins a flat message graph. Answers use the focus author's first person, with
+longer joins a flat message graph. Answers use third-person narration, with
 explicit “Author → Recipient” labels; unaddressed speech carries only the author's
-name. Different recipients remain separate. Display names take priority over usernames.
+name. Unknown people are explicitly left unspecified. Different recipients remain
+separate. Display names take priority over usernames.
 The summary must preserve negation, uncertainty and limits: listening to music does
 not imply playing it, and one melody played with one finger does not imply general
 proficiency. This adds no model call and does not alter original transcripts.

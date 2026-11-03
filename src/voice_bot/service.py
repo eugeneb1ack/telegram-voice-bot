@@ -33,7 +33,7 @@ from voice_bot.conversation import Anchor, ConversationKey, ConversationMemory, 
 from voice_bot.deduplication import ProcessedVoices, RecentResults, voice_keys
 from voice_bot.delivery import ephemeral, forum_topic_id, recipient, reply_to
 from voice_bot.dialogue import DialogueContext, DialogueInput
-from voice_bot.dialogue_graph import shared_dialogue
+from voice_bot.dialogue_graph import CONTEXT_LOOKBACK_SECONDS, shared_dialogue
 from voice_bot.errors import NoSpeechError, ProviderError, RecognitionError, UserFacingError
 from voice_bot.jobs import VoiceJobQueue
 from voice_bot.journal import DeliveryUncertain, QueueJournal, request_key
@@ -181,6 +181,7 @@ class VoiceService:
             max_entries=settings.context_max_messages,
             path=settings.context_state_file,
             series_gap=settings.context_series_gap_seconds,
+            history_lookback=CONTEXT_LOOKBACK_SECONDS,
         )
         self.dialogue = DialogueContext(self.memory, settings, self._context_allowed)
         self.batcher = VoiceBatcher(

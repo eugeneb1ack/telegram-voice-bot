@@ -63,6 +63,8 @@ async def test_only_semantically_selected_source_reaches_summary(settings):
                             "confidence": "high",
                             "current_quote": "У этого велосипеда",
                             "source_quote": "Выбрал синий велосипед",
+                            "mention": "",
+                            "referent": "",
                         }
                     ]
                 }
@@ -90,6 +92,8 @@ def link(**overrides):
         "confidence": "high",
         "current_quote": "У этого велосипеда",
         "source_quote": "Выбрал синий велосипед",
+        "mention": "",
+        "referent": "",
         **overrides,
     }
 

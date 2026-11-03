@@ -1,11 +1,31 @@
 """A bounded shared conversation, with explicit authors and reply edges."""
 
+import re
 from dataclasses import dataclass, replace
 
 from voice_bot.conversation import ConversationKey, ConversationMemory, Entry
 from voice_bot.reply_context import ReplyContext
 
 MAX_REPLY_DEPTH = 3
+CONTEXT_LOOKBACK_SECONDS = 300
+
+
+def leading_person(text: str) -> str | None:
+    """Only an unresolved third-person opening can inherit an old person's name."""
+    match = re.match(
+        r"^[\s\W]*(?:(?:ну|а|и|кстати|короче|вот|да|нет|смотри)\b[\s,]*)*"
+        r"(он|она|они|его|её|ее|ему|ей|he|she|they|him|her)\b",
+        text,
+        re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+@dataclass(frozen=True)
+class ResolvedReference:
+    source_id: int
+    mention: str
+    referent: str
 
 
 @dataclass(frozen=True)
@@ -18,6 +38,16 @@ class DialogueMessage:
     text: str
     reply_to_message_id: int | None = None
     unavailable_reason: str | None = None
+    sent_at: float | None = None
+    references: tuple[ResolvedReference, ...] = ()
+
+
+def within_lookback(current: DialogueMessage, source: DialogueMessage) -> bool:
+    if source.message_id >= current.message_id:
+        return False
+    if current.sent_at is None or source.sent_at is None:
+        return False
+    return 0 <= current.sent_at - source.sent_at <= CONTEXT_LOOKBACK_SECONDS
 
 
 @dataclass(frozen=True)
@@ -67,6 +97,7 @@ def shared_dialogue(
             entry.kind,
             entry.text,
             ref.reply_to_message_id if ref else None,
+            sent_at=entry.sent_at,
         )
     focus_ids = tuple(nodes)
     # The full focus text has its existing source budget. Shared background has one
@@ -82,7 +113,7 @@ def shared_dialogue(
             mid = max(entry.message_ids)
             if len(entry.message_ids) != 1 or mid in nodes:
                 continue
-            if not (0 <= sent_at - entry.sent_at <= memory.ttl and mid < message_id):
+            if not (0 <= sent_at - entry.sent_at <= memory.retention and mid < message_id):
                 continue
             ref = next((r for r in entry.reply_contexts if r.message_id == mid), None)
             if ref is not None:
@@ -97,6 +128,7 @@ def shared_dialogue(
                 entry.kind,
                 entry.text,
                 ref.reply_to_message_id if ref else None,
+                sent_at=entry.sent_at,
             )
     edges.update((ref.message_id, ref) for ref in references if ref.message_id in nodes)
     # Breadth first: all direct targets precede more distant ancestors. A cached
@@ -132,6 +164,7 @@ def shared_dialogue(
                 (ref.unavailable_reason or "Контекст недоступен или ограничен лимитом")
                 if not text
                 else None,
+                sent_at=cached.sent_at if cached else None,
             )
             following.append(target_id)
         frontier = following
@@ -189,6 +222,16 @@ def shared_dialogue(
         candidate_pool = {
             **candidates,
             **{mid: n for mid, n in nodes.items() if mid not in focus_ids},
+        }
+        candidate_pool = {
+            mid: node
+            for mid, node in candidate_pool.items()
+            if mid in nodes
+            or any(
+                within_lookback(nodes[fid], node)
+                for fid in focus_ids
+                if nodes[fid].reply_to_message_id is None
+            )
         }
         recent = sorted(
             candidate_pool.values(),
