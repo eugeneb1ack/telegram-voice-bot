@@ -10,11 +10,12 @@ Telegram bot for voice messages.
 
 ## Conversation context
 
-Each voice gets its complete transcript immediately, with a typing indicator during
-processing. A cumulative summary replies to every third voice from the same author:
-voices 3, 6, 9, and so on. Nearby text from that author contributes context but does
-not increment the voice counter. Summaries use source messages, never summaries of
-summaries. A standalone recording of at least 30 seconds keeps its usual summary;
+A typing indicator runs during processing. Every third voice from the same author
+(3, 6, 9, and so on) gets one combined reply: a summary of the current three voices
+and the current recording’s full collapsible transcript. No separate summary message
+is sent. The first two transcripts are delivered immediately. Nearby text from that author contributes context but does
+not increment the voice counter. The sixth reply summarizes voices 4–6; earlier source messages clarify
+references without being summarized again. A standalone recording of at least 30 seconds keeps its usual summary;
 continuations are summarized on every third voice. Forwarded batches remain separate.
 
 A gap over 180 seconds between the author's messages starts a new series. Defaults:
@@ -28,8 +29,9 @@ not historical Telegram messages.
 Context and delivery markers survive restarts via an atomic snapshot with mode 0600.
 One bot process must own one data directory; do not share it between instances.
 Unprocessed voice jobs still queue in RAM. A storage failure disables cumulative
-summaries while ordinary transcription continues. Ambiguous Telegram deliveries
-are not automatically repeated; the next group of three includes available context.
+summaries while ordinary transcription continues. Summaries use the same queue and delivery deduplication as ordinary transcripts.
+If the combined result exceeds Telegram’s limit, it is split while preserving the
+entire transcript.
 
 See `CONTEXT_*` in [.env.example](.env.example). `CONTEXT_SUMMARY_EVERY=0` disables
 cumulative summaries; `CONTEXT_TTL_SECONDS=0` disables context collection entirely.

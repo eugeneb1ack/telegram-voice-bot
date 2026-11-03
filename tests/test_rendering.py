@@ -119,3 +119,19 @@ def test_batch_is_closed_details_with_plain_title_and_full_quoted_text(count, su
             "Первая тема.",
             "Вторая тема.",
         ]
+
+
+def test_three_voice_heading_shares_reply_with_full_current_transcript():
+    transcript = "  Третья запись <&>\n\nс пробелами.  "
+    replies = render_replies("Итог трёх.", transcript, summary_title="Коротко · 3 голосовых:")
+    assert len(replies) == 1
+    assert replies[0].startswith("<b>Коротко · 3 голосовых:</b>")
+    assert ParsedReply(replies[0]).transcript == transcript
+
+
+def test_three_voice_heading_preserves_parsed_limit_for_long_unicode_transcript():
+    transcript = "👩‍💻 <&>\n" * 1000
+    replies = render_replies("Итог трёх.", transcript, summary_title="Коротко · 3 голосовых:")
+    parsed = [ParsedReply(reply) for reply in replies]
+    assert all(utf16_length(reply.plain) <= 4096 for reply in parsed)
+    assert "".join(reply.transcript for reply in parsed) == transcript

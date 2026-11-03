@@ -39,22 +39,25 @@ async def text(service, number, words, *, author=222, seconds=None):
     await service.observe_text(message)
 
 
-async def test_third_and_sixth_voice_summarize_all_sources_without_intermediate_calls(settings):
+async def test_third_and_sixth_voice_are_single_combined_replies_for_each_new_triple(settings):
+    from test_rendering import ParsedReply
+
     service, bot, _ = setup(settings)
     for number in range(1, 7):
         message = await voice(service, bot, number)
-        assert "Расшифровка:" in message.answer.await_args.args[0]
-        await service.dialogue.process_due(bot)
-        assert bot.send_message.await_count == number // 3
+        message.answer.assert_awaited_once()
+        reply = message.answer.await_args.args[0]
+        assert ParsedReply(reply).transcript == f"  Мысль {number}.\n"
+        assert ("Коротко · 3 голосовых:" in reply) == (number % 3 == 0)
+        assert service.summarizer.summarize.await_count == number // 3
+        assert message.answer.await_args.kwargs["reply_parameters"].message_id == number
     calls = service.summarizer.summarize.await_args_list
-    assert len(calls) == 2
     assert all(f"Мысль {i}." in calls[0].args[0] for i in (1, 2, 3))
-    assert all(f"Мысль {i}." in calls[1].args[0] for i in range(1, 7))
-    assert [c.kwargs["reply_parameters"].message_id for c in bot.send_message.await_args_list] == [
-        3,
-        6,
-    ]
+    assert all(f"Мысль {i}." in calls[1].args[0] for i in (4, 5, 6))
+    assert all(f"Мысль {i}." not in calls[1].args[0] for i in (1, 2, 3))
+    assert len(calls[1].kwargs["context"].recent_summaries) == 3
     assert all(c.kwargs["context"].is_conversation for c in calls)
+    bot.send_message.assert_not_awaited()
     await service.close()
 
 
@@ -76,14 +79,15 @@ async def test_text_is_source_not_a_voice_counter_and_out_of_order_stt_keeps_eve
     await task
     service.transcriber.transcribe.side_effect = None
     await voice(service, bot, 4)
-    await service.dialogue.process_due(bot)
+    await service.dialogue.maintain()
     bot.send_message.assert_not_awaited()
-    await voice(service, bot, 5)
-    await service.dialogue.process_due(bot)
+    last = await voice(service, bot, 5)
+    await service.dialogue.maintain()
     source = service.summarizer.summarize.await_args.args[0]
     assert source.index("Встреча") < source.index("Место") < source.index("Уточнение")
-    assert "голосовых: 3, текстовых: 2" in bot.send_message.await_args.kwargs["text"]
-    assert bot.send_message.await_args.kwargs["reply_parameters"].message_id == 5
+    assert "Коротко · 3 голосовых:" in last.answer.await_args.args[0]
+    assert last.answer.await_args.kwargs["reply_parameters"].message_id == 5
+    bot.send_message.assert_not_awaited()
     await service.close()
 
 
@@ -93,13 +97,15 @@ async def test_restart_between_second_and_third_restores_context_and_does_not_re
     await voice(service, bot, 2)
     await service.close()
     restarted, bot, _ = setup(settings)
-    await voice(restarted, bot, 3)
-    await restarted.dialogue.process_due(bot)
-    bot.send_message.assert_awaited_once()
+    last = await voice(restarted, bot, 3)
+    await restarted.dialogue.maintain()
+    last.answer.assert_awaited_once()
+    assert "Коротко · 3 голосовых:" in last.answer.await_args.args[0]
+    bot.send_message.assert_not_awaited()
     assert all(f"Мысль {i}" in restarted.summarizer.summarize.await_args.args[0] for i in (1, 2, 3))
     await restarted.close()
     third, bot, _ = setup(settings)
-    await third.dialogue.process_due(bot)
+    await third.dialogue.maintain()
     third.summarizer.summarize.assert_not_awaited()
     bot.send_message.assert_not_awaited()
     await third.close()
@@ -109,8 +115,8 @@ async def test_three_minute_gap_resets_counter_but_new_series_still_summarizes(s
     service, bot, _ = setup(settings)
     for number, seconds in [(1, 0), (2, 20), (3, 250), (4, 270), (5, 290)]:
         await voice(service, bot, number, seconds=seconds)
-        await service.dialogue.process_due(bot)
-        assert bot.send_message.await_count == int(number == 5)
+        await service.dialogue.maintain()
+        assert service.summarizer.summarize.await_count == int(number == 5)
     source = service.summarizer.summarize.await_args.args[0]
     assert "Мысль 1" not in source and "Мысль 2" not in source
     assert all(f"Мысль {i}" in source for i in (3, 4, 5))
@@ -132,50 +138,54 @@ async def test_conversation_does_not_mix_scopes(settings, separation):
     elif separation == "private":
         third.receiver_user = identified_message(3, author=444).from_user
     await service.handle(third, bot)
-    await service.dialogue.process_due(bot)
+    await service.dialogue.maintain()
     bot.send_message.assert_not_awaited()
     await service.close()
 
 
-async def test_fourth_and_fifth_do_not_cancel_third_summary_or_consume_next_group(settings):
+async def test_later_voice_and_text_cannot_change_third_combined_reply(settings):
     service, bot, _ = setup(settings)
-    for i in range(1, 4):
-        await voice(service, bot, i)
+    await voice(service, bot, 1)
+    await voice(service, bot, 2)
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def summarize(source, *, context):
         entered.set()
         await release.wait()
+        assert "будущее" not in source
         return "Итог трёх."
 
     service.summarizer.summarize.side_effect = summarize
-    task = asyncio.create_task(service.dialogue.process_due(bot))
+    third = asyncio.create_task(voice(service, bot, 3))
     await entered.wait()
-    await voice(service, bot, 4)
-    await voice(service, bot, 5)
+    fourth = asyncio.create_task(voice(service, bot, 4))
+    await text(service, 5, "будущее уточнение")
     release.set()
-    await task
-    assert bot.send_message.await_args.kwargs["reply_parameters"].message_id == 3
-    await service.dialogue.process_due(bot)
-    bot.send_message.assert_awaited_once()
-    await voice(service, bot, 6)
-    await service.dialogue.process_due(bot)
-    assert bot.send_message.await_args.kwargs["reply_parameters"].message_id == 6
+    last, continuation = await asyncio.gather(third, fourth)
+    last.answer.assert_awaited_once()
+    assert last.answer.await_args.kwargs["reply_parameters"].message_id == 3
+    assert "Коротко · 3 голосовых:" in last.answer.await_args.args[0]
+    assert "Коротко" not in continuation.answer.await_args.args[0]
+    bot.send_message.assert_not_awaited()
     await service.close()
 
 
-async def test_ambiguous_send_is_not_retried_on_restart_and_transcripts_survive(settings):
+async def test_summary_failure_keeps_one_reply_and_next_triple_starts_cleanly(settings):
     service, bot, _ = setup(settings)
+    service.summarizer.summarize.side_effect = TimeoutError("SECRET")
     for i in range(1, 4):
         message = await voice(service, bot, i)
         message.answer.assert_awaited_once()
-    bot.send_message.side_effect = TimeoutError("private content must not be logged")
-    await service.dialogue.process_due(bot)
+    assert "Не удалось составить" in message.answer.await_args.args[0]
+    assert "Мысль 3." in message.answer.await_args.args[0]
+    service.summarizer.summarize.side_effect = None
+    for i in range(4, 7):
+        message = await voice(service, bot, i)
+    assert service.summarizer.summarize.await_count == 2
+    source = service.summarizer.summarize.await_args.args[0]
+    assert "Мысль 1." not in source and "Мысль 6." in source
+    bot.send_message.assert_not_awaited()
     await service.close()
-    restarted, bot, _ = setup(settings)
-    await restarted.dialogue.process_due(bot)
-    restarted.summarizer.summarize.assert_not_awaited()
-    await restarted.close()
 
 
 async def test_storage_failure_keeps_transcription_and_disables_deferred_summary(
@@ -190,7 +200,7 @@ async def test_storage_failure_keeps_transcription_and_disables_deferred_summary
     for i in range(1, 4):
         message = await voice(service, bot, i)
         message.answer.assert_awaited_once()
-    await service.dialogue.process_due(bot)
+    await service.dialogue.maintain()
     bot.send_message.assert_not_awaited()
     assert not service.memory.available
     await service.close()
@@ -234,7 +244,7 @@ async def test_blocked_group_context_is_discarded_before_model_call(settings, tm
         await service.handle(message, bot)
     group = store.groups[-100]
     store.decide(-100, group.revision, "denied")
-    await service.dialogue.process_due(bot)
+    await service.dialogue.maintain()
     bot.send_message.assert_not_awaited()
     assert not service.memory.sessions
     await service.close()
@@ -269,23 +279,30 @@ async def test_private_text_request_has_no_public_typing_or_context(settings):
 async def test_many_interleaved_chats_topics_and_authors_never_mix_sources(settings):
     import re
 
-    from voice_bot.conversation import Anchor
+    from aiogram.types import User
 
     service, bot, _ = setup(settings)
     keys = [
         (chat, topic, author) for chat in range(1, 6) for topic in (0, 7) for author in range(1, 5)
     ]
-    # Same local message IDs and visible names deliberately collide across scopes.
-    for number in range(1, 4):
-        for key in reversed(keys):
-            label = f"scope={key[0]}/{key[1]}/{key[2]}"
-            service.memory.remember(
-                key,
-                number * 15,
-                (number,),
-                f"{label} часть {number}",
-                anchor=Anchor(number, "Одинаковое имя", None, "private"),
-            )
+    messages = []
+    for key in keys:
+        base = key[2] * 1000 + key[1] * 100
+        label = f"scope={key[0]}/{key[1]}/{key[2]}"
+        for number in (1, 2):
+            sent_at = identified_message(number, seconds=number * 15).date.timestamp()
+            service.memory.remember(key, sent_at, (base + number,), f"{label} часть {number}")
+        message = identified_message(base + 3, duration=10, author=key[2], seconds=45)
+        message.chat.id = key[0]
+        message.message_thread_id = key[1] or None
+        message.from_user = User(id=key[2], first_name="Одинаковое имя", is_bot=False)
+        messages.append(message)
+
+    async def transcribe(message, _):
+        scope = f"{message.chat.id}/{message.message_thread_id or 0}/{message.from_user.id}"
+        return f"scope={scope} часть 3"
+
+    service._transcribe = AsyncMock(side_effect=transcribe)
     running = peak = 0
     seen = []
 
@@ -302,43 +319,28 @@ async def test_many_interleaved_chats_topics_and_authors_never_mix_sources(setti
         return scope
 
     service.summarizer.summarize.side_effect = summarize
-    while len(seen) < len(keys):
-        await service.dialogue.process_due(bot)
-        assert len(service.dialogue.jobs) <= settings.max_concurrent_jobs
+    await asyncio.gather(*(service.handle(m, bot) for m in reversed(messages)))
     assert len(seen) == len(set(seen)) == 40
-    assert peak == settings.max_concurrent_jobs
-    for call in bot.send_message.await_args_list:
-        scope = re.search(r"\n\n(\d+)/(\d+)/(\d+)$", call.kwargs["text"])
-        assert scope
-        assert call.kwargs["chat_id"] == int(scope[1])
-        assert (call.kwargs["message_thread_id"] or 0) == int(scope[2])
-        assert call.kwargs["reply_parameters"].message_id == 3
+    assert peak <= settings.max_concurrent_jobs
+    for message in messages:
+        message.answer.assert_awaited_once()
+        call = message.answer.await_args
+        assert (
+            f"{message.chat.id}/{message.message_thread_id or 0}/{message.from_user.id}"
+            in call.args[0]
+        )
+        assert call.kwargs["reply_parameters"].message_id == message.message_id
+    bot.send_message.assert_not_awaited()
     await service.close()
 
 
-async def test_summary_workers_are_bounded_while_voice_capacity_is_busy(settings):
-    from voice_bot.conversation import Anchor
-
+async def test_idle_maintenance_never_creates_summary_requests_or_messages(settings):
     service, bot, _ = setup(settings)
-    for chat in range(1, 21):
-        for number in range(1, 4):
-            service.memory.remember(
-                (chat, 0, 222),
-                number,
-                (number,),
-                "Речь",
-                anchor=Anchor(number, "Имя", None, "private"),
-            )
-    for _ in range(settings.max_concurrent_jobs):
-        await service._capacity.acquire()
-    for _ in range(3):
-        await service.dialogue.process_due(bot, wait=False)
-    assert len(service.dialogue.jobs) == settings.max_concurrent_jobs
+    for number in range(1, 10):
+        service.memory.remember((123, 0, 222), number, (number,), "Речь")
+    await service.dialogue.maintain()
     service.summarizer.summarize.assert_not_awaited()
-    for _ in range(settings.max_concurrent_jobs):
-        service._capacity.release()
-    await service.dialogue.process_due(bot)
-    assert service.summarizer.summarize.await_count == settings.max_concurrent_jobs
+    bot.send_message.assert_not_awaited()
     await service.close()
 
 
@@ -422,4 +424,20 @@ async def test_disabled_summaries_still_remove_expired_text_from_disk(settings):
         await asyncio.sleep(0.005)
     assert json.loads(settings.context_state_file.read_text())["sessions"] == []
     bot.send_message.assert_not_awaited()
+    await service.close()
+
+
+async def test_legacy_separate_summary_watermark_does_not_repeat_an_old_triple(settings):
+    service, bot, _ = setup(settings)
+    for number in (1, 2, 3):
+        sent_at = identified_message(number, seconds=number * 15).date.timestamp()
+        service.memory.remember((123, 0, 222), sent_at, (number,), f"Старое {number}")
+    service.memory.sessions[(123, 0, 222)].claimed_through = 3
+    for number in (4, 5, 6):
+        message = await voice(service, bot, number)
+        message.answer.assert_awaited_once()
+        assert ("Коротко · 3 голосовых:" in message.answer.await_args.args[0]) == (number == 6)
+    call = service.summarizer.summarize.await_args
+    assert "Старое" not in call.args[0]
+    assert len(call.kwargs["context"].recent_summaries) == 3
     await service.close()
