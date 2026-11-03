@@ -72,11 +72,11 @@ def pack(message: Message, *, include_reply: bool = True) -> dict[str, Any]:
         "ephemeral_message_id",
     }
     data = message.model_dump(mode="json", include=fields, exclude_none=True)
+    if message.caption:
+        data["caption"] = message.caption[:8000]
     if not include_reply:
         if message.text:
             data["text"] = message.text[:8000]
-        if message.caption:
-            data["caption"] = message.caption[:8000]
     else:
         target = reply_target(message)
         if target is not None:

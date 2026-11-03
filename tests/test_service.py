@@ -864,7 +864,7 @@ async def test_concurrent_author_messages_receive_preceding_summary_in_order(set
     service, bot, _ = make_dependencies(settings)
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def transcribe(path):
+    async def transcribe(path, *, keywords=()):
         if not entered.is_set():
             entered.set()
             await release.wait()

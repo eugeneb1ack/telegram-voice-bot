@@ -66,7 +66,7 @@ async def test_text_is_source_not_a_voice_counter_and_out_of_order_stt_keeps_eve
     await text(service, 1, "Встреча завтра в пять.")
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def transcribe(_):
+    async def transcribe(_, *, keywords=()):
         entered.set()
         await release.wait()
         return "Место встречи — парк."

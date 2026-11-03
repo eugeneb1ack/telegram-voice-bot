@@ -48,6 +48,7 @@ from voice_bot.reply_context import (
     media_kind,
     reply_target,
 )
+from voice_bot.stt_context import vocabulary
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -61,7 +62,7 @@ def summary_context(message: Message) -> SummaryContext:
     if isinstance(origin, MessageOriginUser):
         user = origin.sender_user
     elif isinstance(origin, MessageOriginHiddenUser):
-        name = origin.sender_user_name.strip() or None
+        name = origin.sender_user_name
     elif isinstance(origin, MessageOriginChat):
         sender_chat = origin.sender_chat
     elif isinstance(origin, MessageOriginChannel):
@@ -73,7 +74,12 @@ def summary_context(message: Message) -> SummaryContext:
     if sender_chat is not None:
         name, username = sender_chat.title or None, sender_chat.username
     elif user is not None:
-        name, username = user.full_name or None, user.username
+        name = getattr(user, "full_name", None)
+        if not name or not name.strip():
+            name = getattr(user, "first_name", None)
+        username = user.username
+    if name is not None:
+        name = " ".join(name.split()) or None
     reply = getattr(message, "reply_to_message", None)
     reply_text = (
         (getattr(reply, "text", None) or getattr(reply, "caption", None)) if reply else None
@@ -677,6 +683,44 @@ class VoiceService:
 
         return finished
 
+    def _transcription_keywords(self, message: Message) -> tuple[str, ...]:
+        if (
+            self.settings.stt_model != "gpt-transcribe"
+            or not self.memory.available
+            or not self.memory.ttl
+        ):
+            return ()
+        self.memory.purge()
+        typed_sources: list[str] = []
+        recognized_sources: list[str] = []
+        if caption := getattr(message, "caption", None):
+            typed_sources.append(caption)
+        target = reply_target(message)
+        if target is not None:
+            if text := getattr(target, "text", None) or getattr(target, "caption", None):
+                typed_sources.append(text)
+            if media_kind(target) in {"voice", "video_note"}:
+                known = self.memory.source(message.chat.id, target.message_id)
+                reference = self.memory.reply_source(message.chat.id, target.message_id)
+                if known:
+                    recognized_sources.append(known)
+                elif reference and reference.kind == media_kind(target):
+                    recognized_sources.append(reference.text)
+        position = conversation_position(message)
+        if position is not None:
+            key, sent_at = position
+            if session := self.memory.sessions.get(key):
+                entries = [
+                    entry
+                    for entry in session.entries
+                    if 0 <= sent_at - entry.sent_at <= self.settings.context_series_gap_seconds
+                    and (entry.sent_at, max(entry.message_ids)) < (sent_at, message.message_id)
+                ][-3:]
+                # Typed spelling takes precedence over earlier recognition candidates.
+                typed_sources.extend(e.text for e in reversed(entries) if e.kind == "text")
+                recognized_sources.extend(e.text for e in reversed(entries) if e.kind == "voice")
+        return vocabulary((*typed_sources, *recognized_sources))
+
     async def _transcribe(self, message: Message, bot: Bot) -> str:
         settings, voice = self.settings, message.voice
         assert voice is not None
@@ -691,6 +735,14 @@ class VoiceService:
         cached = self._result_get(cache_key)
         if cached is not None:
             return cached
+        hint_key = "stt-keywords:" + voice_keys(message)[0]
+        saved_hints = self._result_get(hint_key)
+        if saved_hints is None:
+            hints = self._transcription_keywords(message)
+            # Freeze the spelling hints with the job before any STT request/retry.
+            self._result_put(hint_key, json.dumps(hints, ensure_ascii=False))
+        else:
+            hints = tuple(json.loads(saved_hints))
         with tempfile.TemporaryDirectory(prefix="voice-bot-") as directory:
             source, wav = Path(directory) / "source.ogg", Path(directory) / "voice.wav"
             async with asyncio.timeout(settings.download_timeout_seconds):
@@ -717,7 +769,11 @@ class VoiceService:
             logger.info("audio_converted message_id=%s", message.message_id)
             if not self.work_allowed(message):
                 raise UserFacingError("Обработка в этом чате отключена.")
-            transcript = await self.transcriber.transcribe(wav)
+            transcript = (
+                await self.transcriber.transcribe(wav, keywords=hints)
+                if hints
+                else await self.transcriber.transcribe(wav)
+            )
             self._result_put(cache_key, transcript)
             logger.info("transcription_completed message_id=%s", message.message_id)
             return transcript
