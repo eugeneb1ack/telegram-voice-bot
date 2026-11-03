@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     allowed_chat_ids: set[int] = Field(default_factory=set)
     owner_id: int = Field(default=0, ge=0)
     group_state_file: Path = Path("data/groups.json")
+    queue_state_file: Path = Path("data/queue.sqlite3")
     processed_state_file: Path = Path("data/processed.jsonl")
     processed_max_messages: int = Field(default=50000, ge=100, le=1000000)
     private_usage_file: Path = Path("data/private-usage.json")
