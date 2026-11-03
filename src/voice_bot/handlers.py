@@ -6,6 +6,7 @@ from aiogram.types import ErrorEvent, Message
 
 from voice_bot.delivery import personal
 from voice_bot.modes import is_admin
+from voice_bot.reply_context import as_voice
 from voice_bot.service import VoiceService
 
 logger = logging.getLogger(__name__)
@@ -29,12 +30,12 @@ def build_router(service: VoiceService) -> Router:
             await service.admin.observe(message.chat, bot)
         if not service.chat_allowed(message):
             return
-        original = message.reply_to_message
-        if original is None or not original.voice:
+        original = as_voice(message.reply_to_message) if message.reply_to_message else None
+        if original is None:
             external = message.external_reply
             if (
                 external is not None
-                and external.voice is not None
+                and (external.voice is not None or external.video_note is not None)
                 and external.chat is not None
                 and external.chat.id == message.chat.id
                 and external.message_id is not None
@@ -46,8 +47,10 @@ def build_router(service: VoiceService) -> Router:
                     date=external.origin.date,
                     chat=external.chat,
                     voice=external.voice,
+                    video_note=external.video_note,
                     forward_origin=external.origin,
                 ).as_(bot)
+                original = as_voice(original)
             else:
                 if original is None and external is None:
                     text = "Отправьте /text ответом на голосовое сообщение."
@@ -63,6 +66,7 @@ def build_router(service: VoiceService) -> Router:
                     )
                 await service.notify(message, text)
                 return
+        assert original is not None
         if original.chat.id != message.chat.id:
             await service.notify(message, "Перешлите саму запись в этот чат или мне в личку.")
             return
@@ -75,8 +79,8 @@ def build_router(service: VoiceService) -> Router:
             original = original.model_copy(update={"receiver_user": message.receiver_user})
         await service.enqueue(original, bot, requester=message)
 
-    router.message.register(service.accept, F.voice)
-    router.message.register(service.observe_text, F.text)
+    router.message.register(service.accept, F.voice | F.video_note)
+    router.message.register(service.observe_text, F.text | F.caption)
 
     @router.errors()
     async def safe_error_handler(event: ErrorEvent) -> bool:

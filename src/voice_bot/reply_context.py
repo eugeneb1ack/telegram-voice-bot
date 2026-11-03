@@ -6,6 +6,15 @@ from aiogram.types import Message, Voice
 
 
 @dataclass(frozen=True)
+class PendingReplyMedia:
+    file_id: str
+    file_unique_id: str
+    duration: int
+    file_size: int | None
+    date: float
+
+
+@dataclass(frozen=True)
 class ReplyContext:
     message_id: int
     reply_to_message_id: int
@@ -14,6 +23,8 @@ class ReplyContext:
     kind: str
     text: str
     unavailable_reason: str | None = None
+    author_id: int | None = None
+    pending_media: PendingReplyMedia | None = None
 
 
 def reply_target(message: Message) -> Message | None:
@@ -80,8 +91,9 @@ def bounded_contexts(
 ) -> tuple[ReplyContext, ...]:
     result: list[ReplyContext] = []
     budget = max(0, max_chars)
-    # One source per own message, at most ten voices in a batch; keep explicit links.
-    for context in contexts[:10]:
+    # Cumulative series may contain more than one forwarded batch's ten voices.
+    # Preserve the edges even when the source-text budget is exhausted.
+    for context in contexts[:100]:
         if context.kind not in {"text", "voice", "video_note"}:
             continue
         text = context.text

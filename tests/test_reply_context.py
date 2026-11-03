@@ -174,7 +174,36 @@ async def test_reply_on_first_voice_survives_restart_before_third(settings):
         await restarted.close()
 
 
-async def test_next_triple_does_not_inherit_foreign_reply_sources(settings):
+async def test_short_voices_defer_uncached_reply_media_until_summary_across_restart(settings):
+    service, bot, _ = setup(settings)
+    await process_voice(service, bot, 10, foreign_message(kind="video_note"))
+    await process_voice(service, bot, 11)
+    # Only the two current recordings were recognized; an old source cannot delay them.
+    assert service.transcriber.transcribe.await_count == 2
+    reference = service.memory.sessions[(-100, 0, 222)].entries[0].reply_contexts[0]
+    assert reference.pending_media is not None and reference.text == ""
+    await service.close()
+    restarted, bot, _ = setup(settings)
+    restarted.transcriber.transcribe.side_effect = ["Третья собственная мысль", FOREIGN_TEXT]
+    try:
+        await process_voice(restarted, bot, 12)
+        assert restarted.transcriber.transcribe.await_count == 2
+        refs = restarted.summarizer.summarize.await_args.kwargs["context"].reply_contexts
+        assert refs[0].text == FOREIGN_TEXT and refs[0].pending_media is None
+        assert refs[0].author_id == 444
+        restarted.transcriber.transcribe.side_effect = None
+        for mid in (13, 14, 15):
+            await process_voice(restarted, bot, mid)
+        assert restarted.transcriber.transcribe.await_count == 5
+        assert (
+            restarted.summarizer.summarize.await_args.kwargs["context"].reply_contexts[0].text
+            == FOREIGN_TEXT
+        )
+    finally:
+        await restarted.close()
+
+
+async def test_sixth_voice_keeps_earlier_explicit_sources_in_the_cumulative_summary(settings):
     service, bot, _ = setup(settings)
     try:
         for number in range(10, 16):
@@ -182,7 +211,9 @@ async def test_next_triple_does_not_inherit_foreign_reply_sources(settings):
         calls = service.summarizer.summarize.await_args_list
         assert len(calls) == 2
         assert calls[0].kwargs["context"].reply_contexts
-        assert calls[1].kwargs["context"].reply_contexts == ()
+        assert (
+            calls[1].kwargs["context"].reply_contexts == calls[0].kwargs["context"].reply_contexts
+        )
         assert FOREIGN_TEXT not in calls[1].args[0]
         assert all(FOREIGN_TEXT not in text for text in calls[1].kwargs["context"].recent_summaries)
         assert all(f"Собственная мысль {number}." in calls[1].args[0] for number in (13, 14, 15))

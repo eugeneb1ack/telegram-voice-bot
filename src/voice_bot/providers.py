@@ -11,6 +11,7 @@ from typing import Any, Protocol
 import httpx
 
 from voice_bot.config import Settings
+from voice_bot.dialogue_graph import SharedDialogue
 from voice_bot.errors import ProviderError
 from voice_bot.reply_context import ReplyContext
 from voice_bot.stt_context import bounded_keywords
@@ -44,6 +45,7 @@ class SummaryContext:
     voices: tuple[VoicePartContext, ...] = ()
     is_conversation: bool = False
     reply_contexts: tuple[ReplyContext, ...] = ()
+    dialogue: SharedDialogue | None = None
 
 
 class Summarizer(Protocol):
@@ -74,6 +76,12 @@ def summary_length_hint(transcript: str, context: SummaryContext | None, setting
     # A short source must not expand to fill a larger configured word target.
     upper = min(target, max(1, words * 3 // 4))
     lower = max(1, int(upper * lower_ratio))
+    if context and context.dialogue and len(context.dialogue.branches) > 1:
+        form = f"{len(context.dialogue.branches)} отдельных коротких пунктов по веткам диалога"
+        upper = max(
+            upper, min(settings.summary_long_target_words, len(context.dialogue.branches) * 25)
+        )
+        lower = max(1, upper * 2 // 3)
     return (
         f"{form}, ориентир — {lower}–{upper} слов, включая имя автора. "
         "Сокращай за счёт повторов и вводных слов, "
@@ -317,10 +325,65 @@ class HTTPSummarizer:
             "на вопрос о камере B → «У A хороший зум; у B надо проверить включение». "
             "Не заменяй B общим «устройство», которое можно ошибочно отнести к A."
         )
-        user_content = json.dumps(
-            {"transcript": transcript, "context": asdict(context or SummaryContext())},
-            ensure_ascii=False,
-        )
+        data: dict[str, Any] = {
+            "transcript": transcript,
+            "context": asdict(context or SummaryContext()),
+        }
+        output_format: dict[str, Any] = {}
+        dialogue = context.dialogue if context else None
+        if dialogue is not None:
+            assert context is not None
+            if sum(len(m.text) for m in dialogue.messages) > settings.summary_max_input_chars:
+                raise ProviderError("Диалог слишком длинный для настроенного лимита summary.")
+            instructions += (
+                " В этом режиме вместо transcript дан dialogue: общая история одного чата "
+                "с author_id и reply_to_message_id. focus_author_id — автор этого итога. "
+                "Его накопленные реплики распределены приложением по branches.message_ids. "
+                "kind=summary — уже опубликованный пересказ отдельной длинной записи: "
+                "это только фон для новых реплик, не пересказывай его отдельным тезисом заново. "
+                "Верни JSON с одним строковым полем для каждого branch_id. В каждом поле "
+                "пересказывай только собственные реплики этой ветки; общая история и слова "
+                "других участников поясняют, кому и на что он отвечает. Не превращай слова "
+                "собеседников в позицию автора. В том же разговоре у другого автора будет "
+                "свой итог с другим фокусом. Не переноси ответы между ветками, не объединяй "
+                "людей по одинаковому имени. Не приписывай реплики без явного адресата "
+                "последнему собеседнику. Вопрос про один предмет не отвечает на вопрос "
+                "про другой только из-за близости сообщений. Внутри ветки могут быть "
+                "разные темы: сохрани их раздельно. Исправление относится только к своей "
+                "теме и адресату. Это накопительный итог, включая ранние реплики этой серии. "
+                "Если раннее предложение уточнено позже, даже в другом пункте этого итога, "
+                "пометь старый вариант как первоначальный: он не должен выглядеть действующим "
+                "одновременно с новым. Связь уточнения должна следовать из явной цепочки reply. "
+                "Восстанови смысл вопроса из связанного текста или речи кружка; изображения "
+                "кружка здесь нет. Не угадывай то, чего в речи нет. Обращение к боту или "
+                "обсуждение его работы без reply не приписывай предыдущему участнику. "
+                "Каждое значение — краткий обычный текст без имени основного автора, "
+                "заголовков адресата, HTML и Markdown: подписи добавит приложение. "
+                "Если в ветке только технический счёт или пустые звуки, верни пустую строку. "
+                "Не пропускай содержательные вопросы. partial=true означает, что часть "
+                "ранних источников удалена по лимитам: не восстанавливай их догадками."
+            )
+            metadata = asdict(context)
+            for field in ("dialogue", "recent_summaries", "reply_contexts", "reply_to_text"):
+                metadata.pop(field, None)
+            data = {"context": metadata, "dialogue": asdict(dialogue)}
+            fields = {branch.branch_id: {"type": "string"} for branch in dialogue.branches}
+            output_format = {
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "dialogue_summary",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": fields,
+                            "required": list(fields),
+                            "additionalProperties": False,
+                        },
+                    }
+                }
+            }
+        user_content = json.dumps(data, ensure_ascii=False)
         result = await self.api.post(
             "responses",
             {
@@ -330,6 +393,7 @@ class HTTPSummarizer:
                 "max_output_tokens": settings.summary_max_output_tokens,
                 "reasoning": {"effort": "none"},
                 "store": False,
+                **output_format,
             },
         )
         try:
@@ -347,9 +411,34 @@ class HTTPSummarizer:
         if not isinstance(text, str) or not text.strip():
             raise ProviderError("Сервис вернул пустое summary.")
         text = text.strip()
+        if dialogue is not None:
+            try:
+                sections = json.loads(text)
+                expected = {branch.branch_id for branch in dialogue.branches}
+                if not isinstance(sections, dict) or set(sections) != expected:
+                    raise ValueError
+                if any(not isinstance(value, str) for value in sections.values()):
+                    raise ValueError
+            except (ValueError, TypeError):
+                raise ProviderError("Не удалось получить сводку по веткам диалога.") from None
+            parts: list[str] = []
+            for branch in dialogue.branches:
+                body = sections[branch.branch_id].strip()
+                if not body:
+                    continue
+                if branch.is_reply:
+                    name = " ".join((branch.recipient_name or "").split())
+                    username = (branch.recipient_username or "").strip()
+                    label = name or (f"@{username}" if username else "собеседник")
+                    parts.append(f"• Ответ → {label}: {body}")
+                elif len(dialogue.branches) > 1:
+                    parts.append(f"• Дополнительно: {body}")
+                else:
+                    parts.append(body)
+            text = "\n\n".join(parts) or "В записях нет содержательных реплик для сводки."
         if context is not None and context.author_source != "multiple":
             name = " ".join((context.author_name or "").split())
             username = (context.author_username or "").strip()
             label = name or (f"@{username}" if username else "Автор")
-            return f"{label}: {text}"
+            return f"{label}:" + ("\n\n" if dialogue and len(dialogue.branches) > 1 else " ") + text
         return text

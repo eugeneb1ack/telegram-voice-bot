@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from voice_bot.config import Settings
 from voice_bot.conversation import ConversationKey, ConversationMemory, Entry, Session
+from voice_bot.dialogue_graph import SharedDialogue, shared_dialogue
 from voice_bot.reply_context import ReplyContext, bounded_contexts
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,8 @@ class DialogueInput:
     voice_count: int
     duration_seconds: int
     reply_contexts: tuple[ReplyContext, ...] = ()
+    shared: SharedDialogue | None = None
+    partial: bool = False
 
 
 class DialogueContext:
@@ -46,8 +49,23 @@ class DialogueContext:
         every = self.settings.context_summary_every
         if key is None or len(key) != 3 or not every or not self.memory.available:
             return None
+        series = self.memory.activity(key, sent_at)
         session = self.memory.sessions.get(key)
         if session is None or not self.allowed(key, session):
+            return None
+        if series is None:
+            return None
+        if not series.summarized_count:
+            through = max(session.summarized_through, session.claimed_through)
+            series.summarized_count = sum(
+                len(e.message_ids)
+                for e in session.entries
+                if e.kind == "voice"
+                and e.sent_at >= series.started_at
+                and max(e.message_ids) <= through
+            )
+        count = series.voice_count + int(message_id > series.counted_through)
+        if count - series.summarized_count < every:
             return None
         previous = [
             e
@@ -58,26 +76,15 @@ class DialogueContext:
         entries = previous + [
             Entry((message_id,), sent_at, transcript, "voice", duration_seconds, reply_contexts)
         ]
-        start = 0
-        for index in range(1, len(entries)):
-            if (
-                entries[index].sent_at - entries[index - 1].sent_at
-                > self.settings.context_series_gap_seconds
-            ):
-                start = index
-        # Old separate-message snapshots retain their watermark during the upgrade.
-        through = max(session.summarized_through, session.claimed_through)
-        unseen = [e for e in entries[start:] if e.kind == "voice" and max(e.message_ids) > through]
-        if len(unseen) < every:
-            return None
-        voices = unseen[-every:]
-        first_id = min(voices[0].message_ids)
         sources = [
             e
-            for e in entries[start:]
-            if max(e.message_ids) > through and (e.kind == "text" or min(e.message_ids) >= first_id)
+            for e in entries
+            if e.summary is None and (e.kind == "text" or e.sent_at >= series.started_at)
         ]
-        background = tuple(e.text for e in previous if e not in sources)
+        voices = [e for e in sources if e.kind == "voice"]
+        count -= series.summary_offset
+        partial = len(voices) < count or any(e.text.endswith("…") for e in sources)
+        background = tuple(e.summary or e.text for e in previous if e not in sources)
         references = bounded_contexts(
             tuple(context for entry in sources for context in entry.reply_contexts),
             min(6000, self.settings.context_max_chars // 2),
@@ -91,8 +98,18 @@ class DialogueContext:
             ),
             background=background,
             reply_contexts=references,
-            voice_count=len(voices),
+            voice_count=count,
             duration_seconds=sum(e.duration_seconds for e in voices),
+            shared=shared_dialogue(
+                self.memory,
+                key,
+                sources,
+                references,
+                sent_at,
+                message_id,
+                partial=partial,
+            ),
+            partial=partial,
         )
 
     def start(self) -> None:

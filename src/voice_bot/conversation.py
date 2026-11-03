@@ -19,6 +19,7 @@ from voice_bot.reply_context import ReplyContext, bounded_contexts
 
 logger = logging.getLogger(__name__)
 ConversationKey = tuple[int, ...]  # chat, topic, author; optional forwarding scope
+MAX_SERIES = 64
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,7 @@ class Entry:
     kind: Literal["voice", "text"] = "voice"
     duration_seconds: int = 0
     reply_contexts: tuple[ReplyContext, ...] = ()
+    summary: str | None = None
 
 
 @dataclass
@@ -40,6 +42,16 @@ class Anchor:
 
 
 @dataclass
+class Series:
+    started_at: float
+    last_at: float
+    voice_count: int = 0
+    counted_through: int = 0
+    summarized_count: int = 0
+    summary_offset: int = 0
+
+
+@dataclass
 class Session:
     expires_at: float
     entries: list[Entry] = field(default_factory=list)
@@ -47,6 +59,7 @@ class Session:
     anchor: Anchor | None = None
     # Legacy watermark from separate-message summaries, retained for snapshot compatibility.
     claimed_through: int = 0
+    series: list[Series] = field(default_factory=list)
 
 
 class ConversationMemory:
@@ -59,6 +72,7 @@ class ConversationMemory:
         *,
         max_entries: int = 2,
         path: Path | None = None,
+        series_gap: float = 900,
     ) -> None:
         self.ttl = ttl_seconds
         self.max_chars = max_chars
@@ -66,6 +80,7 @@ class ConversationMemory:
         self.max_entries = max_entries
         self.clock = clock
         self.path = path
+        self.series_gap = series_gap
         self.available = True
         self.sessions: OrderedDict[ConversationKey, Session] = OrderedDict()
         self._locks: dict[ConversationKey, tuple[asyncio.Lock, int]] = {}
@@ -75,7 +90,8 @@ class ConversationMemory:
         if path is not None and path.exists():
             try:
                 if path.stat().st_size > max(
-                    100_000, max_sessions * (max_chars * 6 + max_entries * 500 + 2000)
+                    100_000,
+                    max_sessions * (max_chars * 6 + max_entries * 500 + MAX_SERIES * 256 + 2000),
                 ):
                     raise ValueError
                 data = json.loads(path.read_text())
@@ -85,9 +101,31 @@ class ConversationMemory:
                 for key, session in adapter.validate_python(data["sessions"]):
                     if len(key) not in (3, 4) or any(not e.message_ids for e in session.entries):
                         raise ValueError
+                    if len(session.series) > MAX_SERIES or any(
+                        s.last_at < s.started_at
+                        or s.counted_through < 0
+                        or not 0 <= s.summarized_count <= s.voice_count
+                        or not 0 <= s.summary_offset <= s.summarized_count
+                        for s in session.series
+                    ):
+                        raise ValueError
                     self._trim(session)
+                    if not session.series:
+                        for entry in session.entries:
+                            if entry.kind == "voice":
+                                series = self._activity(session, entry.sent_at)
+                                series.voice_count += len(entry.message_ids)
+                                series.counted_through = max(entry.message_ids)
+                                if series.counted_through <= max(
+                                    session.summarized_through, session.claimed_through
+                                ):
+                                    series.summarized_count = series.voice_count
                     session.expires_at = min(session.expires_at, self.clock() + self.ttl)
-                    if session.entries and session.expires_at > self.clock() and self.ttl:
+                    if (
+                        (session.entries or session.series)
+                        and session.expires_at > self.clock()
+                        and self.ttl
+                    ):
                         self.sessions[key] = session
                 while len(self.sessions) > self.max_sessions:
                     self.sessions.popitem(last=False)
@@ -160,6 +198,51 @@ class ConversationMemory:
                             return context
         return None
 
+    def _activity(self, session: Session, sent_at: float) -> Series:
+        for series in reversed(session.series):
+            if (
+                series.started_at
+                <= sent_at
+                < min(series.last_at + self.series_gap, series.started_at + self.ttl)
+            ):
+                series.last_at = max(series.last_at, sent_at)
+                return series
+        series = Series(sent_at, sent_at)
+        session.series.append(series)
+        session.series.sort(key=lambda item: item.started_at)
+        newest = max(item.last_at for item in session.series)
+        session.series = [s for s in session.series if newest - s.last_at <= self.ttl][-MAX_SERIES:]
+        return series
+
+    def activity(self, key: ConversationKey | None, sent_at: float) -> Series | None:
+        """Record event timing at admission, independently of bounded source text and STT."""
+        self.purge()
+        if key is None or len(key) != 3 or not self.ttl or not self.available:
+            return None
+        session = self.sessions.get(key)
+        if session is None:
+            session = Session(expires_at=self.clock() + self.ttl)
+            self.sessions[key] = session
+        series = self._activity(session, sent_at)
+        session.expires_at = self.clock() + self.ttl
+        self.sessions.move_to_end(key)
+        while len(self.sessions) > self.max_sessions:
+            self.sessions.popitem(last=False)
+        self._schedule_expiry()
+        return series
+
+    def series_at(self, key: ConversationKey, sent_at: float) -> Series | None:
+        session = self.sessions.get(key)
+        if session is not None:
+            for series in reversed(session.series):
+                if (
+                    series.started_at
+                    <= sent_at
+                    < min(series.last_at + self.series_gap, series.started_at + self.ttl)
+                ):
+                    return series
+        return None
+
     def remember(
         self,
         key: ConversationKey | None,
@@ -171,6 +254,7 @@ class ConversationMemory:
         duration_seconds: int = 0,
         anchor: Anchor | None = None,
         reply_contexts: tuple[ReplyContext, ...] = (),
+        summary: str | None = None,
     ) -> None:
         self.purge()
         if key is None or not self.ttl or not text.strip() or not self.available:
@@ -182,23 +266,22 @@ class ConversationMemory:
             latest = session.entries[-1].sent_at
             if latest - sent_at > self.ttl:
                 return
-            if sent_at - latest > self.ttl:
-                session = None
         if session is None:
             session = Session(expires_at=self.clock() + self.ttl)
             self.sessions[key] = session
+        if len(key) == 3 and kind == "voice":
+            series = self._activity(session, sent_at)
+            if max(message_ids) > series.counted_through:
+                series.voice_count += len(message_ids)
+                series.counted_through = max(message_ids)
         session.entries.append(
-            Entry(message_ids, sent_at, text, kind, duration_seconds, reply_contexts)
+            Entry(message_ids, sent_at, text, kind, duration_seconds, reply_contexts, summary)
         )
         session.entries.sort(key=lambda e: (e.sent_at, max(e.message_ids)))
         self._trim(session)
         session.expires_at = self.clock() + self.ttl
-        if anchor and any(
-            anchor.message_id in e.message_ids for e in session.entries if e.kind == "voice"
-        ):
-            last_voice = next(e for e in reversed(session.entries) if e.kind == "voice")
-            if anchor.message_id in last_voice.message_ids:
-                session.anchor = anchor
+        if anchor and (session.anchor is None or anchor.message_id >= session.anchor.message_id):
+            session.anchor = anchor
         self.sessions.move_to_end(key)
         while len(self.sessions) > self.max_sessions:
             self.sessions.popitem(last=False)
@@ -217,7 +300,9 @@ class ConversationMemory:
                 break
             reply_contexts = bounded_contexts(entry.reply_contexts, limit // 3)
             reply_chars = sum(len(context.text) for context in reply_contexts)
-            text_limit = limit - reply_chars
+            summary = entry.summary[: min(2000, limit // 3)] if entry.summary else None
+            summary_chars = len(summary or "")
+            text_limit = limit - reply_chars - summary_chars
             text = entry.text
             if len(text) > text_limit:
                 text = text[: max(0, text_limit - 1)] + "…"
@@ -229,9 +314,10 @@ class ConversationMemory:
                     entry.kind,
                     entry.duration_seconds,
                     reply_contexts,
+                    summary,
                 )
             )
-            budget -= len(text) + reply_chars
+            budget -= len(text) + reply_chars + summary_chars
         session.entries = list(reversed(result))
 
     def purge(self) -> None:

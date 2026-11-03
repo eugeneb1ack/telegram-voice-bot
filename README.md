@@ -10,25 +10,47 @@ Telegram bot for voice messages.
 
 ## Conversation context
 
-A typing indicator runs during processing. Every third voice from the same author
-(3, 6, 9, and so on) gets one combined reply: a summary of the current three voices
-and the current recording’s full collapsible transcript. No separate summary message
-is sent. The first two transcripts are delivered immediately. Nearby text from that author contributes context but does
-not increment the voice counter. The sixth reply summarizes voices 4–6; earlier source messages clarify
-references without being summarized again. A standalone recording of at least 30 seconds keeps its usual summary;
-continuations are summarized on every third voice. Forwarded batches remain separate.
+A typing indicator runs during processing. Each author's third, sixth and ninth
+voice receives one reply containing the cumulative series summary and the full
+collapsible transcript of the current recording. The third covers voices 1–3;
+the sixth covers 1–6. The first two short voices receive transcripts only. A
+standalone recording of at least 30 seconds keeps its ordinary summary. After a
+successful standalone summary, count three new voices; its existing recap becomes
+background only. A long first voice plus two short ones therefore produces no
+second summary on message three: the new triple completes on message four. A failed
+standalone summary does not mark the recording as summarized. Forwarded
+batches remain separate. Round video notes count as voices and contribute speech
+only. Ordinary video files are not transcribed; their captions can supply text.
 
-A gap over 180 seconds between the author's messages starts a new series. Defaults:
-15-minute TTL, 12 messages and 12,000 characters per context, at most 200 contexts.
-Older context is evicted when a limit is reached; Telegram transcripts stay complete.
-Keys contain chat, actual forum topic and author IDs. Ordinary replies stay in the
-same author's series; a reply-chain ID is not a forum topic. Display names are not identifiers.
-Forwarded voices use a separate scope. Private `/text` does not read or populate
-public context; quiet mode does not collect text. Only received updates are used,
-not historical Telegram messages.
+A series spans at most 15 minutes from its first voice. The counter restarts at
+that boundary: two voices followed by a third two hours later never form a triple.
+Text does not extend the boundary. `CONTEXT_SERIES_GAP_SECONDS` (default 900) can
+additionally limit silence between voices; `CONTEXT_TTL_SECONDS` caps total series
+length and ambient context age.
 
-Context and delivery markers survive restarts via an atomic snapshot with mode 0600.
-One bot process must own one data directory; do not share it between instances.
+Counters are per author; ambient history is shared only within the same chat and
+actual forum topic. The model receives attributed messages and exact reply edges,
+using existing transcripts, text and captions from the last 15 minutes. Other
+speakers clarify the focus author's words without becoming their statements.
+Replies to different recipients get separate sections; unaddressed messages remain
+separate. An explicit reply to an old source can clarify that answer without
+loading the entire older conversation. Telegram IDs identify people; display names
+are preferred over usernames in labels.
+
+Defaults: 12 messages and 12,000 characters per author, at most 200 active contexts.
+Shared background has one additional 12,000-character budget and at most 100 nodes,
+not a separate budget per participant. Durable counters survive source-text eviction.
+If limits evict earlier sources, the third voice still gets a summary explicitly
+marked as covering the available portion. Missing content is never reconstructed.
+Telegram transcripts stay complete. Forwarded messages have separate scope; private
+`/text` neither reads nor populates public memory. Quiet mode does not collect text.
+Only received Telegram updates are used; old chat history is never fetched.
+
+The first two short replies do not wait for an uncached older reply source to be
+transcribed. Its bounded media metadata persists until the cumulative summary and
+survives restarts. Existing transcripts are reused. A summary can still take longer
+when its older source has never been recognized.
+
 Unprocessed voices and delivery progress persist in a SQLite journal. A context snapshot
 failure disables cumulative summaries; a queue journal failure stops polling before
 acknowledging further updates. Summaries use the same queue and delivery deduplication as ordinary transcripts.
@@ -79,7 +101,7 @@ and content-free counting are omitted from the summary, with full transcripts pr
 
 `gpt-transcribe` receives up to 16 literal vocabulary hints (320 characters total)
 from the explicit reply, the recording's caption and up to three preceding messages
-from the same author, chat and forum topic within the 180-second series window.
+from the same author, chat and forum topic within the 15-minute context window.
 Existing voice transcripts may contribute vocabulary; source audio is never reprocessed
 just to build hints. Typed spelling takes precedence over earlier speech recognition.
 Only available text is used: an unrecognized referenced recording is not downloaded
