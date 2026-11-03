@@ -1,4 +1,4 @@
-"""Bounded in-memory voice queue with round-robin scheduling between chats."""
+"""Bounded voice scheduling with round-robin fairness between chats."""
 
 import asyncio
 import logging
@@ -36,12 +36,12 @@ class VoiceJobQueue:
         self.closed = False
         self._changed = asyncio.Event()
 
-    def add(self, messages: list[Message], bot: Bot) -> bool:
-        if self.closed or not messages or self.size >= self.max_pending:
+    def add(self, messages: list[Message], bot: Bot, *, restoring: bool = False) -> bool:
+        if self.closed or not messages or (not restoring and self.size >= self.max_pending):
             return False
         chat_id = messages[-1].chat.id
         waiting = self.pending.get(chat_id)
-        if waiting is not None and len(waiting) >= self.max_per_chat:
+        if not restoring and waiting is not None and len(waiting) >= self.max_per_chat:
             return False
         if waiting is None:
             waiting = deque()

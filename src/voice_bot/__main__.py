@@ -18,6 +18,7 @@ from voice_bot.commands import CommandCleanup
 from voice_bot.config import Settings
 from voice_bot.groups import GroupStore
 from voice_bot.handlers import build_router
+from voice_bot.journal import JournalUnavailable, QueueJournal
 from voice_bot.modes import build_modes_router
 from voice_bot.providers import APIClient, HTTPSummarizer, HTTPTranscriber
 from voice_bot.service import VoiceService
@@ -90,13 +91,33 @@ async def run(settings: Settings) -> None:
             trust_env=False,
         ) as client:
             api = APIClient(client, settings)
-            service = VoiceService(settings, HTTPTranscriber(api), HTTPSummarizer(api), admin=admin)
+            journal = QueueJournal(
+                settings.queue_state_file,
+                max_jobs=settings.max_pending_jobs * (settings.voice_batch_max_messages + 1)
+                + settings.max_concurrent_jobs,
+                max_receipts=settings.processed_max_messages,
+            )
+            service = VoiceService(
+                settings, HTTPTranscriber(api), HTTPSummarizer(api), admin=admin, journal=journal
+            )
             dispatcher = Dispatcher()
             cleanup = CommandCleanup(max_pending=settings.max_pending_jobs)
             dispatcher.message.middleware(cleanup)
             dispatcher.include_router(build_admin_router(admin))
             dispatcher.include_router(build_modes_router(admin))
             dispatcher.include_router(build_router(service))
+
+            async def guard_polling(make_request: Any, bot: Bot, method: Any) -> Any:
+                if isinstance(method, GetUpdates) and journal.failed.is_set():
+                    raise JournalUnavailable("Queue journal unavailable")
+                return await make_request(bot, method)
+
+            async def stop_on_storage_failure() -> None:
+                await journal.failed.wait()
+                logger.error("queue_storage_unavailable")
+                await dispatcher.stop_polling()
+
+            session.middleware(guard_polling)
             await admin.notify_pending(bot)
             service.start(bot)
             logger.info(
@@ -105,18 +126,25 @@ async def run(settings: Settings) -> None:
                 me.username,
             )
             # Update handlers enqueue work; voice workers and pending jobs are bounded separately.
+            watcher = asyncio.create_task(stop_on_storage_failure())
             try:
+                await service.recover(bot)
                 await dispatcher.start_polling(
                     bot,
                     allowed_updates=dispatcher.resolve_used_update_types(),
-                    tasks_concurrency_limit=settings.max_concurrent_jobs + 4,
+                    handle_as_tasks=False,  # Persist admission before getUpdates advances offset.
                     close_bot_session=False,
                 )
+                if journal.failed.is_set():
+                    raise JournalUnavailable("Queue journal unavailable")
             finally:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
                 try:
                     await service.close()
                 finally:
                     await cleanup.close()
+                    journal.close()
 
 
 def main() -> None:

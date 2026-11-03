@@ -28,14 +28,58 @@ not historical Telegram messages.
 
 Context and delivery markers survive restarts via an atomic snapshot with mode 0600.
 One bot process must own one data directory; do not share it between instances.
-Unprocessed voice jobs still queue in RAM. A storage failure disables cumulative
-summaries while ordinary transcription continues. Summaries use the same queue and delivery deduplication as ordinary transcripts.
+Unprocessed voices and delivery progress persist in a SQLite journal. A context snapshot
+failure disables cumulative summaries; a queue journal failure stops polling before
+acknowledging further updates. Summaries use the same queue and delivery deduplication as ordinary transcripts.
 If the combined result exceeds Telegram’s limit, it is split while preserving the
 entire transcript.
 
 See `CONTEXT_*` in [.env.example](.env.example). `CONTEXT_SUMMARY_EVERY=0` disables
 cumulative summaries; `CONTEXT_TTL_SECONDS=0` disables context collection entirely.
 When upgrading, change an explicitly configured `CONTEXT_MAX_CHARS=800` to `12000`.
+
+## Durable queue
+
+Accepted voices, including forwarded voices still being collected, survive process
+restarts. Queue admission commits before polling acknowledges the update. Scheduling
+remains bounded and ordered within each chat. Recognized text and prepared summaries
+are checkpointed, so recovery reuses completed model results. Previous voices used as
+summary context are never transcribed again.
+
+Every outgoing part is journaled before sending and its Telegram ID is committed
+immediately after confirmation. Recovery skips confirmed parts, including long replies
+and cached copies. A new explicit `/text` command remains a new private delivery.
+The same polling update is not a new request. Existing queue/concurrency limits apply.
+The journal uses standard-library SQLite, WAL and FULL synchronization, and an exclusive
+process lock; no new service or dependency is needed. `QUEUE_STATE_FILE` defaults to
+`data/queue.sqlite3` and Compose places it in the persistent data volume.
+
+**Transport limit:** Telegram Bot API has no send idempotency key. A crash or network
+loss between sending and saving the acknowledgment leaves delivery uncertain. Such a
+job is retained and is **not automatically resent**. This avoids duplicates, but cannot
+guarantee both zero loss and exactly-once delivery in that window. Check the chat before
+resolving it. This also applies to a process killed just before its socket write.
+
+Inspect metadata without texts/audio while the bot is running:
+
+```bash
+docker compose exec voice-bot python -m voice_bot.queue_admin --path /app/data/queue.sqlite3 status
+```
+
+For an uncertain job, verify the exact reply in Telegram, stop the bot, then run one of:
+
+```bash
+docker compose stop voice-bot
+# Confirmed reply ID (0 only for a verified ephemeral reply):
+docker compose run --rm --no-deps voice-bot python -m voice_bot.queue_admin --path /app/data/queue.sqlite3 resolve JOB_ID --delivered-id REPLY_ID
+# OR, only after verifying that the reply was not delivered:
+docker compose run --rm --no-deps voice-bot python -m voice_bot.queue_admin --path /app/data/queue.sqlite3 resolve JOB_ID --not-delivered
+docker compose up -d --no-build
+```
+
+Do not delete the journal to clear a backlog. Back up the entire data volume while the
+bot is stopped. Upgrading from 0.3.0 should use a graceful stop to drain its RAM queue;
+voices accepted by older code cannot be recovered retroactively.
 
 ## Group modes
 
@@ -110,7 +154,10 @@ transcripts and ordinary text are stored in `conversations.json` in the `group-s
 Docker volume to survive restarts. Expired records are removed while the bot runs,
 or on the next startup if it was stopped. This is not a chat archive. Other volume
 files store group permissions and modes, usage counters, identifier hashes and public
-Telegram reply IDs. Pending jobs and temporary delivery results remain in RAM.
+Telegram reply IDs. Pending job metadata, Telegram file IDs, recognized text, summaries
+and delivery progress are stored temporarily in `queue.sqlite3` (mode 0600). Audio is
+not stored there. Completed job payloads are deleted; bounded request hashes prevent
+replay. Unresolved jobs are retained until completed or explicitly reconciled.
 Operational logs contain stage timings without audio, message text, API bodies,
 credentials or Telegram exception contents. Audio, text and context are sent to
 OpenAI for processing; replies remain in Telegram.
