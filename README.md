@@ -18,7 +18,8 @@ context gets at most one sentence (240 characters); the main detail budget belon
 to new messages. The connection is omitted when topics change. Successful summaries
 mark sources as covered; failed summaries retain their sources for the next scheduled
 summary. Each update keeps the same structure and detail for new material. The first two short voices receive transcripts only. A
-standalone recording of at least 30 seconds keeps its ordinary summary. After a
+recording of at least 30 seconds gets an immediate summary at any position in a
+series. Pending shorter recordings are included with it, so they cannot disappear. After a
 successful standalone summary, count three new voices; its existing recap becomes
 background only. A long first voice plus two short ones therefore produces no
 second summary on message three: the new triple completes on message four. A failed

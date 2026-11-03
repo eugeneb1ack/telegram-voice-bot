@@ -1035,17 +1035,6 @@ class VoiceService:
             is_batch or message.voice.duration >= self.settings.summary_min_voice_seconds
         )
         ids = tuple(item.message_id for item in messages)
-        series = self.memory.series_at(key, min(times)) if key is not None and times else None
-        if (
-            not is_batch
-            and key is not None
-            and len(key) == 3
-            and self.settings.context_summary_every
-            and self.memory.available
-            and series is not None
-            and series.voice_count > 0
-        ):
-            needs_summary = False
         summary = (
             "Не удалось составить краткое содержание. Полная расшифровка ниже."
             if needs_summary
@@ -1089,6 +1078,7 @@ class VoiceService:
                         message.message_id,
                         transcript,
                         message.voice.duration,
+                        force=needs_summary,
                     )
                 references: list[ReplyContext] = []
                 for item, recognized in zip(messages, transcripts, strict=True):
@@ -1111,6 +1101,7 @@ class VoiceService:
                         transcript,
                         message.voice.duration,
                         reply_contexts=reply_contexts,
+                        force=needs_summary,
                     )
                     if dialogue is not None:
                         if key is not None and any(
@@ -1126,6 +1117,7 @@ class VoiceService:
                                 transcript,
                                 message.voice.duration,
                                 reply_contexts=reply_contexts,
+                                force=needs_summary,
                             )
                             assert dialogue is not None
                         needs_summary = True

@@ -119,7 +119,7 @@ async def test_standalone_long_summary_starts_new_triplet_and_only_recap_is_back
     third = await voice(service, bot, 3, seconds=20)
     assert "Коротко" not in third.answer.await_args.args[0]
     fourth = await voice(service, bot, 4, seconds=30)
-    assert "Коротко · 3 голосовых:" in fourth.answer.await_args.args[0]
+    assert "Коротко · 4 голосовых:" in fourth.answer.await_args.args[0]
     call = service.summarizer.summarize.await_args
     assert "Мысль 1." not in call.args[0]
     assert all(f"Мысль {n}." in call.args[0] for n in (2, 3, 4))
@@ -129,7 +129,7 @@ async def test_standalone_long_summary_starts_new_triplet_and_only_recap_is_back
     assert all(1 not in b.message_ids for b in graph.branches)
     for n in (5, 6, 7):
         seventh = await voice(service, bot, n, seconds=n * 10)
-    assert "Коротко · 6 голосовых:" in seventh.answer.await_args.args[0]
+    assert "Коротко · 7 голосовых:" in seventh.answer.await_args.args[0]
     assert service.summarizer.summarize.await_count == 2
     await service.close()
 
@@ -143,6 +143,43 @@ async def test_failed_standalone_summary_does_not_mark_voice_as_summarized(setti
     third = await voice(service, bot, 3, seconds=20)
     assert "Коротко · 3 голосовых:" in third.answer.await_args.args[0]
     assert "Мысль 1." in service.summarizer.summarize.await_args.args[0]
+    await service.close()
+
+
+@pytest.mark.parametrize("preceding", [0, 1, 2, 3])
+@pytest.mark.parametrize("duration", [29, 30, 50])
+async def test_long_voice_always_summarizes_at_any_position(settings, preceding, duration):
+    service, bot, _ = setup(settings)
+    for mid in range(1, preceding + 1):
+        await voice(service, bot, mid, seconds=mid * 10)
+    before = service.summarizer.summarize.await_count
+    current = await voice(service, bot, preceding + 1, seconds=50, duration=duration)
+    expected = duration >= 30 or preceding == 2
+    assert ("Коротко" in current.answer.await_args.args[0]) == expected
+    assert service.summarizer.summarize.await_count - before == int(expected)
+    assert f"Мысль {preceding + 1}." in current.answer.await_args.args[0]
+    if duration >= 30 and preceding == 1:
+        # A long voice closes the pending short context too, so it cannot disappear.
+        assert all(
+            f"Мысль {mid}." in service.summarizer.summarize.await_args.args[0] for mid in (1, 2)
+        )
+    await service.close()
+
+
+async def test_long_voice_after_restart_does_not_wait_for_triplet(settings):
+    service, bot, _ = setup(settings)
+    await voice(service, bot, 1, seconds=0)
+    await service.close()
+    service, bot, _ = setup(settings)
+    long = await voice(service, bot, 2, seconds=10, duration=50)
+    assert "Коротко" in long.answer.await_args.args[0]
+    service.summarizer.summarize.assert_awaited_once()
+    for mid in (3, 4):
+        short = await voice(service, bot, mid, seconds=mid * 10)
+        assert "Коротко" not in short.answer.await_args.args[0]
+    fifth = await voice(service, bot, 5, seconds=50)
+    assert "Коротко · 5 голосовых:" in fifth.answer.await_args.args[0]
+    assert service.summarizer.summarize.await_count == 2
     await service.close()
 
 
