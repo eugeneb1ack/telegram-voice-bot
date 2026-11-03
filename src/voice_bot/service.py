@@ -1053,6 +1053,7 @@ class VoiceService:
         )
         dialogue: DialogueInput | None = None
         standalone_summary: str | None = None
+        completed_summary: str | None = None
         reply_contexts: tuple[ReplyContext, ...] = ()
         transcripts: list[str | None] = [None] * len(messages)
         failures = ["Не обработано: превышено время ожидания."] * len(messages)
@@ -1195,6 +1196,7 @@ class VoiceService:
                             )
                             self._result_put(cache_key, cached_summary)
                         summary = cached_summary
+                        completed_summary = cached_summary
                         if dialogue is None and not is_batch and key is not None and len(key) == 3:
                             standalone_summary = cached_summary
                         logger.info("summary_completed message_id=%s", message.message_id)
@@ -1220,6 +1222,7 @@ class VoiceService:
         prepared = {
             "summary": summary,
             "standalone_summary": standalone_summary,
+            "completed_summary": completed_summary,
             "transcript": transcript,
             "title": title,
             "valid": [part is not None for part in transcripts],
@@ -1262,7 +1265,7 @@ class VoiceService:
                 max(times) if times else 0,
                 tuple(item.message_id for item in messages),
                 prepared["transcript"],
-                summary=prepared.get("standalone_summary"),
+                summary=prepared.get("completed_summary") or prepared.get("standalone_summary"),
                 reply_contexts=tuple(
                     ReplyContext(
                         **{
@@ -1285,15 +1288,19 @@ class VoiceService:
                 else None,
             )
             if prepared["dialogue"] and key is not None and key in self.memory.sessions:
-                self.memory.sessions[key].summarized_through = message.message_id
                 series = self.memory.series_at(key, max(times) if times else 0)
                 if series is not None:
                     series.summarized_count = series.voice_count
+                    if prepared.get("completed_summary"):
+                        self.memory.sessions[key].summarized_through = message.message_id
+                        series.covered_count = series.voice_count
             elif prepared.get("standalone_summary") and key is not None:
                 series = self.memory.series_at(key, max(times) if times else 0)
                 if series is not None:
                     series.summarized_count = series.voice_count
                     series.summary_offset = series.voice_count
+                    series.covered_count = series.voice_count
+                    self.memory.sessions[key].summarized_through = message.message_id
             await self.memory.checkpoint()
         return [item for item, valid in zip(messages, prepared["valid"], strict=True) if valid]
 

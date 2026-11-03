@@ -160,7 +160,8 @@ async def test_text_eviction_and_restart_do_not_shift_third_voice(settings):
     assert service.summarizer.summarize.await_args.kwargs["context"].dialogue.partial
     for mid in (11, 12, 13):
         last = await voice(service, bot, mid, seconds=mid * 10)
-    assert "Коротко · 6 голосовых (доступная часть серии):" in last.answer.await_args.args[0]
+    assert "Коротко · 6 голосовых:" in last.answer.await_args.args[0]
+    assert not service.summarizer.summarize.await_args.kwargs["context"].dialogue.partial
     assert service.summarizer.summarize.await_count == 2
     await service.close()
 
@@ -258,10 +259,14 @@ async def test_round_video_participates_in_own_series_and_ordinary_video_only_ca
     "invalid",
     [None, {}, {"b1": 4, "b2": "x", "b3": "y"}, {"b1": "x", "b2": "x", "b3": "x", "b4": "x"}],
 )
-async def test_structured_summary_exact_branches_and_deterministic_names(settings, invalid):
+@pytest.mark.parametrize("previous", [False, True])
+async def test_structured_summary_exact_branches_and_deterministic_names(
+    settings, invalid, previous
+):
     graph = branch_fixture()
     graph = replace(
         graph,
+        has_previous_summary=previous,
         branches=(
             graph.branches[0],
             replace(graph.branches[1], recipient_name=None),
@@ -277,7 +282,9 @@ async def test_structured_summary_exact_branches_and_deterministic_names(setting
         payload = json.loads(request.content)
         calls.append(payload)
         schema = payload["text"]["format"]["schema"]
-        assert schema["required"] == ["b1", "b2", "b3"]
+        assert schema["required"] == (["recap"] if previous else []) + ["b1", "b2", "b3"]
+        if previous:
+            assert schema["properties"]["recap"]["maxLength"] == 240
         assert schema["additionalProperties"] is False
         data = json.loads(payload["input"])
         assert "transcript" not in data
@@ -288,6 +295,8 @@ async def test_structured_summary_exact_branches_and_deterministic_names(setting
             if invalid is not None
             else {"b3": "Про бота.", "b2": "Про девушку.", "b1": "Вопрос про кота."}
         )
+        if previous and invalid is None:
+            answer["recap"] = "Обсуждали поездку с котом."
         return httpx.Response(
             200,
             json={
@@ -309,7 +318,9 @@ async def test_structured_summary_exact_branches_and_deterministic_names(setting
         else:
             result = await summarizer.summarize("Текст", context=context)
             assert (
-                result == "Имя автора:\n\n• Ответ → Анна: Вопрос про кота."
+                result
+                == "Имя автора:\n\n" + ("Ранее: Обсуждали поездку с котом.\n\n" if previous else "")
+                + "• Ответ → Анна: Вопрос про кота."
                 "\n\n• Ответ → @user3: Про девушку.\n\n• Дополнительно: Про бота."
             )
     assert len(calls) == 1

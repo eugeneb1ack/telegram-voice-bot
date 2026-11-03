@@ -49,6 +49,7 @@ class Series:
     counted_through: int = 0
     summarized_count: int = 0
     summary_offset: int = 0
+    covered_count: int | None = None
 
 
 @dataclass
@@ -110,6 +111,10 @@ class ConversationMemory:
                     ):
                         raise ValueError
                     self._trim(session)
+                    for series in session.series:
+                        if series.covered_count is None:
+                            # Earlier snapshots used this watermark for delivered coverage.
+                            series.covered_count = series.summarized_count
                     if not session.series:
                         for entry in session.entries:
                             if entry.kind == "voice":
@@ -120,6 +125,7 @@ class ConversationMemory:
                                     session.summarized_through, session.claimed_through
                                 ):
                                     series.summarized_count = series.voice_count
+                                    series.covered_count = series.voice_count
                     session.expires_at = min(session.expires_at, self.clock() + self.ttl)
                     if (
                         (session.entries or session.series)
@@ -207,7 +213,7 @@ class ConversationMemory:
             ):
                 series.last_at = max(series.last_at, sent_at)
                 return series
-        series = Series(sent_at, sent_at)
+        series = Series(sent_at, sent_at, covered_count=0)
         session.series.append(series)
         session.series.sort(key=lambda item: item.started_at)
         newest = max(item.last_at for item in session.series)

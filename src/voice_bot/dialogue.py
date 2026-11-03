@@ -64,6 +64,7 @@ class DialogueContext:
                 and e.sent_at >= series.started_at
                 and max(e.message_ids) <= through
             )
+            series.covered_count = max(series.covered_count or 0, series.summarized_count)
         count = series.voice_count + int(message_id > series.counted_through)
         if count - series.summarized_count < every:
             return None
@@ -79,11 +80,14 @@ class DialogueContext:
         sources = [
             e
             for e in entries
-            if e.summary is None and (e.kind == "text" or e.sent_at >= series.started_at)
+            if e.summary is None
+            and max(e.message_ids) > session.summarized_through
+            and (e.kind == "text" or e.sent_at >= series.started_at)
         ]
         voices = [e for e in sources if e.kind == "voice"]
+        new_count = count - (series.covered_count or 0)
+        partial = len(voices) < new_count or any(e.text.endswith("…") for e in sources)
         count -= series.summary_offset
-        partial = len(voices) < count or any(e.text.endswith("…") for e in sources)
         background = tuple(e.summary or e.text for e in previous if e not in sources)
         references = bounded_contexts(
             tuple(context for entry in sources for context in entry.reply_contexts),
@@ -108,6 +112,7 @@ class DialogueContext:
                 sent_at,
                 message_id,
                 partial=partial,
+                has_previous_summary=bool(series.covered_count),
             ),
             partial=partial,
         )

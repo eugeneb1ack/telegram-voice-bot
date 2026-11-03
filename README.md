@@ -13,7 +13,11 @@ Telegram bot for voice messages.
 A typing indicator runs during processing. Each author's third, sixth and ninth
 voice receives one reply containing the cumulative series summary and the full
 collapsible transcript of the current recording. The third covers voices 1–3;
-the sixth covers 1–6. The first two short voices receive transcripts only. A
+the sixth connects the previous recap to a full summary of voices 4–6. Earlier
+context gets at most one sentence (240 characters); the main detail budget belongs
+to new messages. The connection is omitted when topics change. Successful summaries
+mark sources as covered; failed summaries retain their sources for the next scheduled
+summary. Each update keeps the same structure and detail for new material. The first two short voices receive transcripts only. A
 standalone recording of at least 30 seconds keeps its ordinary summary. After a
 successful standalone summary, count three new voices; its existing recap becomes
 background only. A long first voice plus two short ones therefore produces no

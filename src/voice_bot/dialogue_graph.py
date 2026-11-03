@@ -34,6 +34,7 @@ class SharedDialogue:
     messages: tuple[DialogueMessage, ...]
     branches: tuple[DialogueBranch, ...]
     partial: bool = False
+    has_previous_summary: bool = False
 
 
 def shared_dialogue(
@@ -45,6 +46,7 @@ def shared_dialogue(
     message_id: int,
     *,
     partial: bool = False,
+    has_previous_summary: bool = False,
 ) -> SharedDialogue:
     """No names as keys, no cross-chat/topic ambient data, no future messages."""
     nodes: dict[int, DialogueMessage] = {}
@@ -68,6 +70,10 @@ def shared_dialogue(
     budget = memory.max_chars
     candidates: list[tuple[float, DialogueMessage]] = []
     ambient_references: dict[int, ReplyContext] = {}
+    latest_recap = max(
+        (max(e.message_ids) for e in own.entries if e.summary and max(e.message_ids) < message_id),
+        default=0,
+    )
     for other, session in memory.sessions.items():
         if len(other) != 3 or other[:2] != key[:2]:
             continue
@@ -75,6 +81,13 @@ def shared_dialogue(
         for entry in session.entries:
             mid = max(entry.message_ids)
             if len(entry.message_ids) != 1 or mid in nodes:
+                continue
+            if (
+                other == key
+                and latest_recap
+                and mid <= own.summarized_through
+                and mid != latest_recap
+            ):
                 continue
             if not (0 <= sent_at - entry.sent_at <= memory.ttl and mid < message_id):
                 continue
@@ -89,8 +102,8 @@ def shared_dialogue(
                         other[2],
                         author.author_name if author else None,
                         author.author_username if author else None,
-                        "summary" if entry.summary else entry.kind,
-                        entry.summary or entry.text,
+                        "summary" if other == key and entry.summary else entry.kind,
+                        (entry.summary or entry.text) if other == key else entry.text,
                         ref.reply_to_message_id if ref else None,
                     ),
                 )
@@ -200,5 +213,9 @@ def shared_dialogue(
         for index, (target, ids) in enumerate(groups.values(), 1)
     )
     return SharedDialogue(
-        key[2], tuple(sorted(nodes.values(), key=lambda n: n.message_id)), branches, partial
+        key[2],
+        tuple(sorted(nodes.values(), key=lambda n: n.message_id)),
+        branches,
+        partial,
+        has_previous_summary,
     )
