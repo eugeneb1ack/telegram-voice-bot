@@ -2,9 +2,10 @@
 
 import asyncio
 import logging
+import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from aiogram import Bot
 from aiogram.types import Message
@@ -17,6 +18,7 @@ JobHandler = Callable[[list[Message], Bot], Awaitable[None]]
 class VoiceJob:
     messages: tuple[Message, ...]
     bot: Bot
+    queued_at: float = field(default_factory=time.monotonic)
 
 
 class VoiceJobQueue:
@@ -75,6 +77,11 @@ class VoiceJobQueue:
         while (job := await self._next()) is not None:
             chat_id = job.messages[-1].chat.id
             try:
+                logger.info(
+                    "voice_queue_wait message_id=%s elapsed_ms=%s",
+                    job.messages[-1].message_id,
+                    round((time.monotonic() - job.queued_at) * 1000),
+                )
                 await self.handler(list(job.messages), job.bot)
             except Exception as exc:
                 logger.warning("voice_queue_job_failed error_type=%s", type(exc).__name__)

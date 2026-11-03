@@ -335,4 +335,6 @@ async def test_successful_provider_response_is_not_logged(settings, caplog):
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"text": "private"}))
     ) as client:
         await APIClient(client, settings).post("audio/transcriptions", {})
-    assert not any(record.name == "voice_bot.providers" for record in caplog.records)
+    assert "private" not in caplog.text
+    assert "provider_request_completed" in caplog.text
+    assert "elapsed_ms=" in caplog.text

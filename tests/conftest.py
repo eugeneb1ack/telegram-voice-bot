@@ -14,4 +14,6 @@ def settings(tmp_path):
         allowed_chat_ids=set(),
         processed_state_file=tmp_path / "processed.jsonl",
         private_usage_file=tmp_path / "private-usage.json",
+        context_state_file=tmp_path / "conversations.json",
+        context_summary_every=0,
     )

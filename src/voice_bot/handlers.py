@@ -76,6 +76,7 @@ def build_router(service: VoiceService) -> Router:
         await service.enqueue(original, bot, requester=message)
 
     router.message.register(service.accept, F.voice)
+    router.message.register(service.observe_text, F.text)
 
     @router.errors()
     async def safe_error_handler(event: ErrorEvent) -> bool:

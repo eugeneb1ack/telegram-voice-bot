@@ -840,7 +840,7 @@ async def test_context_does_not_cross_identity_scope_or_time(settings, separatio
 def test_memory_uses_original_identity_and_does_not_guess_hidden_authors():
     message = identified_message(1, forwarded=True)
     key, sent_at = conversation_position(message)
-    assert key == (123, 0, 333)
+    assert key == (123, 0, 333, 1)
     assert sent_at == message.forward_origin.date.timestamp()
     message.forward_origin = MessageOriginHiddenUser(date=0, sender_user_name="Имя")
     assert conversation_position(message) is None
@@ -869,7 +869,7 @@ async def test_concurrent_author_messages_receive_preceding_summary_in_order(set
     await asyncio.gather(first, second)
     calls = service.summarizer.summarize.await_args_list
     assert calls[0].kwargs["context"].recent_summaries == ()
-    assert calls[1].kwargs["context"].recent_summaries == ("Кратко.",)
+    assert calls[1].kwargs["context"].recent_summaries == ("Речь",)
     await service.close()
 
 
