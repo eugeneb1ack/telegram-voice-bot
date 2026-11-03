@@ -423,7 +423,7 @@ async def test_disabled_summaries_still_remove_expired_text_from_disk(settings):
     service.memory.clock = lambda: now[0]
     await text(service, 1, "Истекающий текст")
     assert "Истекающий текст" in settings.context_state_file.read_text()
-    now[0] += settings.context_ttl_seconds + 1
+    now[0] += service.memory.retention + 1
     service.start(bot)
     for _ in range(100):
         if json.loads(settings.context_state_file.read_text())["sessions"] == []:

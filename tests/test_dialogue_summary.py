@@ -51,11 +51,12 @@ async def test_own_speech_and_other_speaker_background_are_separate_on_wire(sett
         assert not b2["background_messages"]
         assert [m["message_id"] for m in b2["primary_messages"]] == [12]
         assert "профессиональный" not in payload["input"]
-        assert "Антон" not in payload["input"]  # the app owns the speaker label
+        assert "Антон" not in payload["input"]
+        assert all("author_name" not in m for m in b1["primary_messages"])
         return response(
             {
-                "b1": "Люблю слушать джаз. Играть не умею, кроме одной мелодии одним пальцем.",
-                "b2": "Сейчас попробую её сыграть.",
+                "b1": "Любит слушать джаз. Играть не умеет, кроме одной мелодии одним пальцем.",
+                "b2": "Собирается попробовать её сыграть.",
             }
         )
 
@@ -64,8 +65,8 @@ async def test_own_speech_and_other_speaker_background_are_separate_on_wire(sett
             "Три записи", context=SummaryContext(author_name="Антон", dialogue=graph)
         )
     assert result == (
-        "• Антон → Борис:\nЛюблю слушать джаз. Играть не умею, кроме одной мелодии одним пальцем."
-        "\n\n• Антон:\nСейчас попробую её сыграть."
+        "• Антон → Борис:\nЛюбит слушать джаз. Играть не умеет, кроме одной мелодии одним пальцем."
+        "\n\n• Антон:\nСобирается попробовать её сыграть."
     )
     assert len(calls) == 1  # no extra verifier/model round trip
 

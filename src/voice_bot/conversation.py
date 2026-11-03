@@ -74,8 +74,11 @@ class ConversationMemory:
         max_entries: int = 2,
         path: Path | None = None,
         series_gap: float = 900,
+        history_lookback: float = 0,
     ) -> None:
         self.ttl = ttl_seconds
+        # Keep background until the pending series ends; never extend its counter.
+        self.retention = ttl_seconds + history_lookback if ttl_seconds else 0
         self.max_chars = max_chars
         self.max_sessions = max_sessions
         self.max_entries = max_entries
@@ -126,7 +129,7 @@ class ConversationMemory:
                                 ):
                                     series.summarized_count = series.voice_count
                                     series.covered_count = series.voice_count
-                    session.expires_at = min(session.expires_at, self.clock() + self.ttl)
+                    session.expires_at = min(session.expires_at, self.clock() + self.retention)
                     if (
                         (session.entries or session.series)
                         and session.expires_at > self.clock()
@@ -227,10 +230,10 @@ class ConversationMemory:
             return None
         session = self.sessions.get(key)
         if session is None:
-            session = Session(expires_at=self.clock() + self.ttl)
+            session = Session(expires_at=self.clock() + self.retention)
             self.sessions[key] = session
         series = self._activity(session, sent_at)
-        session.expires_at = self.clock() + self.ttl
+        session.expires_at = self.clock() + self.retention
         self.sessions.move_to_end(key)
         while len(self.sessions) > self.max_sessions:
             self.sessions.popitem(last=False)
@@ -270,10 +273,10 @@ class ConversationMemory:
             if any(set(e.message_ids).intersection(message_ids) for e in session.entries):
                 return
             latest = session.entries[-1].sent_at
-            if latest - sent_at > self.ttl:
+            if latest - sent_at > self.retention:
                 return
         if session is None:
-            session = Session(expires_at=self.clock() + self.ttl)
+            session = Session(expires_at=self.clock() + self.retention)
             self.sessions[key] = session
         if len(key) == 3 and kind == "voice":
             series = self._activity(session, sent_at)
@@ -285,7 +288,7 @@ class ConversationMemory:
         )
         session.entries.sort(key=lambda e: (e.sent_at, max(e.message_ids)))
         self._trim(session)
-        session.expires_at = self.clock() + self.ttl
+        session.expires_at = self.clock() + self.retention
         if anchor and (session.anchor is None or anchor.message_id >= session.anchor.message_id):
             session.anchor = anchor
         self.sessions.move_to_end(key)
@@ -297,7 +300,7 @@ class ConversationMemory:
         if not session.entries:
             return
         newest = session.entries[-1].sent_at
-        entries = [e for e in session.entries if newest - e.sent_at <= self.ttl]
+        entries = [e for e in session.entries if newest - e.sent_at <= self.retention]
         result: list[Entry] = []
         budget = self.max_chars
         for entry in reversed(entries[-self.max_entries :]):
