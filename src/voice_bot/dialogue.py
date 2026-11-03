@@ -39,7 +39,8 @@ class DialogueSummaries:
         self.jobs: dict[ConversationKey, asyncio.Task[None]] = {}
 
     def start(self, bot: Bot) -> None:
-        if self.task is None and self.memory.ttl and self.settings.context_summary_every:
+        # Maintenance also removes expired on-disk text when summaries or context are disabled.
+        if self.task is None:
             self.task = asyncio.create_task(self._run(bot), name="conversation-summaries")
 
     async def _run(self, bot: Bot) -> None:

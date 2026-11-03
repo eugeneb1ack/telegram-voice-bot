@@ -20,12 +20,16 @@ async def typing(
     interval: float = 4,
 ) -> AsyncIterator[None]:
     async def pulse() -> None:
+        announced = False
         while enabled():
             try:
                 async with asyncio.timeout(3):
                     await bot.send_chat_action(
                         chat_id=chat_id, message_thread_id=topic_id, action="typing"
                     )
+                if not announced:
+                    logger.info("typing_started chat_id=%s topic_id=%s", chat_id, topic_id or 0)
+                    announced = True
             except Exception as exc:
                 logger.debug("typing_unavailable error_type=%s", type(exc).__name__)
                 return
