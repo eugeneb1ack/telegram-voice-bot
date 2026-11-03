@@ -1034,7 +1034,6 @@ class VoiceService:
         needs_summary = (
             is_batch or message.voice.duration >= self.settings.summary_min_voice_seconds
         )
-        ids = tuple(item.message_id for item in messages)
         summary = (
             "Не удалось составить краткое содержание. Полная расшифровка ниже."
             if needs_summary
@@ -1129,7 +1128,9 @@ class VoiceService:
                     context = summary_context(messages[0])
                     context = replace(
                         context,
-                        recent_summaries=self.memory.recent(key, min(times) if times else 0, ids),
+                        # A recent message is not necessarily part of this conversation.
+                        # Standalone summaries use only their exact reply source.
+                        recent_summaries=(),
                         reply_to_text=None,
                         reply_contexts=reply_contexts,
                     )

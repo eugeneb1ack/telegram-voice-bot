@@ -811,7 +811,7 @@ def identified_message(index, *, duration=30, author=222, seconds=0, forwarded=F
     return message
 
 
-async def test_short_voice_context_is_reused_without_extra_summary_request(settings):
+async def test_short_voice_does_not_add_unlinked_context_to_standalone_summary(settings):
     service, bot, _ = make_dependencies(settings)
     first = identified_message(1, duration=7)
     await service.handle(first, bot)
@@ -819,11 +819,11 @@ async def test_short_voice_context_is_reused_without_extra_summary_request(setti
     second = identified_message(2, seconds=30)
     await service.handle(second, bot)
     context = service.summarizer.summarize.await_args.kwargs["context"]
-    assert context.recent_summaries == ("Полный <текст> & да.",)
+    assert context.recent_summaries == ()
     await service.handle(second, bot)
     assert service.summarizer.summarize.await_count == 1
     context = service.summarizer.summarize.await_args.kwargs["context"]
-    assert context.recent_summaries == ("Полный <текст> & да.",)
+    assert context.recent_summaries == ()
     await service.close()
 
 
@@ -860,7 +860,7 @@ def test_memory_uses_original_identity_and_does_not_guess_hidden_authors():
     assert conversation_position(message) is None
 
 
-async def test_concurrent_author_messages_receive_preceding_summary_in_order(settings):
+async def test_concurrent_author_messages_stay_ordered_without_automatic_context(settings):
     service, bot, _ = make_dependencies(settings)
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -880,7 +880,7 @@ async def test_concurrent_author_messages_receive_preceding_summary_in_order(set
     await asyncio.gather(first, second)
     calls = service.summarizer.summarize.await_args_list
     assert calls[0].kwargs["context"].recent_summaries == ()
-    assert calls[1].kwargs["context"].recent_summaries == ("Речь",)
+    assert calls[1].kwargs["context"].recent_summaries == ()
     await service.close()
 
 

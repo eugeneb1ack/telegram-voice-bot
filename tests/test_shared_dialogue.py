@@ -68,7 +68,7 @@ def test_own_reply_chain_follows_original_recipient_and_cycles_terminate():
     ]
 
 
-def test_twenty_participants_share_history_but_keep_separate_counts_and_focus(settings):
+def test_twenty_unlinked_participants_keep_separate_counts_and_sources(settings):
     settings.context_summary_every = 3
     mem = memory()
     context = DialogueContext(mem, settings, lambda *_: True)
@@ -89,8 +89,8 @@ def test_twenty_participants_share_history_but_keep_separate_counts_and_focus(se
         graphs.append(result.shared)
     assert [g.focus_author_id for g in graphs] == [1, 2]
     for graph in graphs:
-        assert {n.author_id for n in graph.messages} == set(range(1, 21))
-        assert len(graph.messages) == 41
+        assert {n.author_id for n in graph.messages} == {graph.focus_author_id}
+        assert len(graph.messages) == 3
         assert all(n.message_id <= 41 for n in graph.messages)
         assert len(graph.branches) == 1
     assert graphs[0].branches[0].message_ids == (1, 21, 41)
@@ -108,7 +108,7 @@ async def test_hard_window_restarts_even_with_continuous_activity(settings):
     await service.close()
 
 
-async def test_standalone_long_summary_starts_new_triplet_and_only_recap_is_background(settings):
+async def test_standalone_long_summary_starts_new_triplet_without_automatic_recap(settings):
     service, bot, _ = setup(settings)
     service.summarizer.summarize.return_value = "Готовый пересказ длинной записи."
     first = await voice(service, bot, 1, seconds=0, duration=40)
@@ -119,17 +119,17 @@ async def test_standalone_long_summary_starts_new_triplet_and_only_recap_is_back
     third = await voice(service, bot, 3, seconds=20)
     assert "Коротко" not in third.answer.await_args.args[0]
     fourth = await voice(service, bot, 4, seconds=30)
-    assert "Коротко · 4 голосовых:" in fourth.answer.await_args.args[0]
+    assert "Коротко · 3 голосовых:" in fourth.answer.await_args.args[0]
     call = service.summarizer.summarize.await_args
     assert "Мысль 1." not in call.args[0]
     assert all(f"Мысль {n}." in call.args[0] for n in (2, 3, 4))
     graph = call.kwargs["context"].dialogue
-    source = next(m for m in graph.messages if m.message_id == 1)
-    assert source.kind == "summary" and source.text == "Готовый пересказ длинной записи."
+    assert [m.message_id for m in graph.messages] == [2, 3, 4]
+    assert not graph.has_previous_summary
     assert all(1 not in b.message_ids for b in graph.branches)
     for n in (5, 6, 7):
         seventh = await voice(service, bot, n, seconds=n * 10)
-    assert "Коротко · 7 голосовых:" in seventh.answer.await_args.args[0]
+    assert "Коротко · 3 голосовых:" in seventh.answer.await_args.args[0]
     assert service.summarizer.summarize.await_count == 2
     await service.close()
 
@@ -178,7 +178,7 @@ async def test_long_voice_after_restart_does_not_wait_for_triplet(settings):
         short = await voice(service, bot, mid, seconds=mid * 10)
         assert "Коротко" not in short.answer.await_args.args[0]
     fifth = await voice(service, bot, 5, seconds=50)
-    assert "Коротко · 5 голосовых:" in fifth.answer.await_args.args[0]
+    assert "Коротко · 3 голосовых:" in fifth.answer.await_args.args[0]
     assert service.summarizer.summarize.await_count == 2
     await service.close()
 
@@ -197,7 +197,7 @@ async def test_text_eviction_and_restart_do_not_shift_third_voice(settings):
     assert service.summarizer.summarize.await_args.kwargs["context"].dialogue.partial
     for mid in (11, 12, 13):
         last = await voice(service, bot, mid, seconds=mid * 10)
-    assert "Коротко · 6 голосовых:" in last.answer.await_args.args[0]
+    assert "Коротко · 3 голосовых:" in last.answer.await_args.args[0]
     assert not service.summarizer.summarize.await_args.kwargs["context"].dialogue.partial
     assert service.summarizer.summarize.await_count == 2
     await service.close()
@@ -249,16 +249,20 @@ def test_shared_background_has_one_budget_for_all_authors():
     mem = memory(max_chars=200)
     for author in range(1, 21):
         mem.remember((-100, 0, author), author, (author,), "длинная реплика " * 100)
-    graph = shared_dialogue(mem, (-100, 0, 1), [Entry((50,), 50, "Фокус")], (), 50, 50)
-    assert sum(len(n.text) for n in graph.messages if n.message_id != 50) <= 200
+    sources = [Entry((50 + i,), 50 + i, "Фокус") for i in range(20)]
+    refs = tuple(replace(ref(50 + i, i + 1, i + 1), text="Контекст " * 100) for i in range(20))
+    graph = shared_dialogue(mem, (-100, 0, 1), sources, refs, 70, 70)
+    assert 0 < sum(len(n.text) for n in graph.messages if n.message_id < 50) <= 200
     assert len(graph.messages) <= 100
 
 
 def test_other_participants_keep_explicit_source_and_reply_edge():
     mem = memory()
     remember(mem, 10, 2, refs=(ref(10, 1, 3, kind="video_note"),))
-    remember(mem, 20)
-    graph = shared_dialogue(mem, (-100, 0, 1), mem.sessions[(-100, 0, 1)].entries, (), 21, 21)
+    remember(mem, 20, refs=(ref(20, 10, 2),))
+    graph = shared_dialogue(
+        mem, (-100, 0, 1), mem.sessions[(-100, 0, 1)].entries, (ref(20, 10, 2),), 21, 21
+    )
     nodes = {n.message_id: n for n in graph.messages}
     assert nodes[10].author_id == 2 and nodes[10].reply_to_message_id == 1
     assert nodes[1].author_id == 3 and nodes[1].kind == "video_note"

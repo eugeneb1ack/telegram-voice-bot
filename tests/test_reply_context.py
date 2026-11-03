@@ -86,7 +86,7 @@ async def test_first_voice_reply_reaches_third_summary_without_becoming_own_spee
         await service.close()
 
 
-async def test_continuous_own_text_series_survives_total_span_over_gap_without_foreign_ambient(
+async def test_text_before_voice_block_is_not_a_new_source(
     settings,
 ):
     service, bot, _ = setup(settings)
@@ -133,10 +133,8 @@ async def test_continuous_own_text_series_survives_total_span_over_gap_without_f
         call = service.summarizer.summarize.await_args
         source = call.args[0]
         context = call.kwargs["context"]
-        assert all(words in source for words in (*own_texts, *voice_texts))
-        assert [source.index(words) for words in own_texts] == sorted(
-            source.index(words) for words in own_texts
-        )
+        assert all(words in source for words in voice_texts)
+        assert all(words not in source for words in own_texts)
         assert context.author_name == "Имя 222" and context.author_source == "sender"
         assert context.is_conversation
         assert foreign_ambient not in source and target_text not in source
@@ -196,14 +194,14 @@ async def test_short_voices_defer_uncached_reply_media_until_summary_across_rest
             await process_voice(restarted, bot, mid)
         assert restarted.transcriber.transcribe.await_count == 5
         assert restarted.memory.reply_source(-100, 1).text == FOREIGN_TEXT
-        assert restarted.summarizer.summarize.await_args.kwargs[
+        assert not restarted.summarizer.summarize.await_args.kwargs[
             "context"
         ].dialogue.has_previous_summary
     finally:
         await restarted.close()
 
 
-async def test_sixth_voice_uses_previous_recap_without_repeating_old_branches(settings):
+async def test_sixth_voice_does_not_inherit_unlinked_sources(settings):
     service, bot, _ = setup(settings)
     try:
         for number in range(10, 16):
@@ -212,7 +210,7 @@ async def test_sixth_voice_uses_previous_recap_without_repeating_old_branches(se
         assert len(calls) == 2
         assert calls[0].kwargs["context"].reply_contexts
         assert calls[1].kwargs["context"].reply_contexts == ()
-        assert calls[1].kwargs["context"].dialogue.has_previous_summary
+        assert not calls[1].kwargs["context"].dialogue.has_previous_summary
         assert service.memory.reply_source(-100, 1).text == FOREIGN_TEXT
         assert FOREIGN_TEXT not in calls[1].args[0]
         assert all(FOREIGN_TEXT not in text for text in calls[1].kwargs["context"].recent_summaries)

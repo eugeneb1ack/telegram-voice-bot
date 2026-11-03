@@ -336,9 +336,12 @@ class HTTPSummarizer:
             if sum(len(m.text) for m in dialogue.messages) > settings.summary_max_input_chars:
                 raise ProviderError("Диалог слишком длинный для настроенного лимита summary.")
             instructions += (
-                " В этом режиме вместо transcript дан dialogue: общая история одного чата "
+                " В этом режиме вместо transcript дан dialogue: выбранный фрагмент одного чата "
                 "с author_id и reply_to_message_id. focus_author_id — автор этого итога. "
                 "Его НОВЫЕ реплики распределены приложением по branches.message_ids. "
+                "Для каждой ветки используй только её message_ids как материал пересказа, "
+                "а context_message_ids — только для пояснения отсылок этой ветки. "
+                "Сообщения остальных веток не добавляй в неё и не дублируй под «Дополнительно». "
                 "kind=summary — уже опубликованный пересказ предыдущих записей: "
                 "это только фон для новых реплик, не пересказывай его отдельным тезисом заново. "
                 "Верни JSON с одним строковым полем для каждого branch_id. В каждом поле "

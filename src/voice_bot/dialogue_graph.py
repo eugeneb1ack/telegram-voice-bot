@@ -1,9 +1,11 @@
 """A bounded shared conversation, with explicit authors and reply edges."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from voice_bot.conversation import ConversationKey, ConversationMemory, Entry
 from voice_bot.reply_context import ReplyContext
+
+MAX_REPLY_DEPTH = 3
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,7 @@ class DialogueBranch:
     recipient_username: str | None
     message_ids: tuple[int, ...]
     is_reply: bool = False
+    context_message_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -46,9 +49,8 @@ def shared_dialogue(
     message_id: int,
     *,
     partial: bool = False,
-    has_previous_summary: bool = False,
 ) -> SharedDialogue:
-    """No names as keys, no cross-chat/topic ambient data, no future messages."""
+    """Select only focus messages and up to three explicit reply ancestors."""
     nodes: dict[int, DialogueMessage] = {}
     own = memory.sessions[key]
     anchor = own.anchor
@@ -68,12 +70,8 @@ def shared_dialogue(
     # The full focus text has its existing source budget. Shared background has one
     # further chat-wide budget, not one extra budget for each of 10–20 participants.
     budget = memory.max_chars
-    candidates: list[tuple[float, DialogueMessage]] = []
-    ambient_references: dict[int, ReplyContext] = {}
-    latest_recap = max(
-        (max(e.message_ids) for e in own.entries if e.summary and max(e.message_ids) < message_id),
-        default=0,
-    )
+    candidates: dict[int, DialogueMessage] = {}
+    edges: dict[int, ReplyContext] = {}
     for other, session in memory.sessions.items():
         if len(other) != 3 or other[:2] != key[:2]:
             continue
@@ -82,104 +80,59 @@ def shared_dialogue(
             mid = max(entry.message_ids)
             if len(entry.message_ids) != 1 or mid in nodes:
                 continue
-            if (
-                other == key
-                and latest_recap
-                and mid <= own.summarized_through
-                and mid != latest_recap
-            ):
-                continue
             if not (0 <= sent_at - entry.sent_at <= memory.ttl and mid < message_id):
                 continue
             ref = next((r for r in entry.reply_contexts if r.message_id == mid), None)
             if ref is not None:
-                ambient_references[mid] = ref
-            candidates.append(
-                (
-                    entry.sent_at,
-                    DialogueMessage(
-                        mid,
-                        other[2],
-                        author.author_name if author else None,
-                        author.author_username if author else None,
-                        "summary" if other == key and entry.summary else entry.kind,
-                        (entry.summary or entry.text) if other == key else entry.text,
-                        ref.reply_to_message_id if ref else None,
-                    ),
-                )
+                edges[mid] = ref
+            # A recap may cover unrelated topics/recipients. An exact reply must
+            # resolve to this recording's transcript, never its aggregate recap.
+            candidates[mid] = DialogueMessage(
+                mid,
+                other[2],
+                author.author_name if author else None,
+                author.author_username if author else None,
+                entry.kind,
+                entry.text,
+                ref.reply_to_message_id if ref else None,
             )
-    # Explicit sources are priority context, including a source across forum topics.
-    for ref in references:
-        if ref.reply_to_message_id not in nodes:
-            text = ref.text[:budget]
+    edges.update((ref.message_id, ref) for ref in references if ref.message_id in nodes)
+    # Breadth first: all direct targets precede more distant ancestors. A cached
+    # target in another forum topic is allowed only as an explicit leaf; we do not
+    # crawl that topic's history. Siblings and replies TO our sources never qualify.
+    frontier = list(focus_ids)
+    for _ in range(MAX_REPLY_DEPTH):
+        following: list[int] = []
+        for mid in frontier:
+            ref = edges.get(mid)
+            if ref is None or ref.reply_to_message_id >= mid:
+                continue
+            target_id = ref.reply_to_message_id
+            if target_id in nodes:
+                following.append(target_id)
+                continue
+            if len(nodes) >= 100:
+                continue
+            cached = candidates.get(target_id)
+            text = ref.text or (cached.text if cached else "")
+            limit = min(budget, 3000)
+            if len(text) > limit:
+                text = text[: max(0, limit - 1)] + ("…" if limit else "")
             budget -= len(text)
-            nodes[ref.reply_to_message_id] = DialogueMessage(
-                ref.reply_to_message_id,
-                ref.author_id,
-                ref.author_name,
-                ref.author_username,
+            nodes[target_id] = DialogueMessage(
+                target_id,
+                cached.author_id if cached else ref.author_id,
+                cached.author_name if cached else ref.author_name,
+                cached.author_username if cached else ref.author_username,
                 ref.kind,
                 text,
-                unavailable_reason=ref.unavailable_reason,
+                cached.reply_to_message_id if cached else None,
+                (ref.unavailable_reason or "Контекст недоступен или ограничен лимитом")
+                if not text
+                else None,
             )
-    # First preserve available ancestors/descendants of focus reply chains.
-    connected = set(nodes)
-    remaining = sorted(candidates, key=lambda pair: (pair[0], pair[1].message_id), reverse=True)
-    ordered: list[DialogueMessage] = []
-    while remaining:
-        selected = [
-            pair
-            for pair in remaining
-            if (
-                pair[1].message_id in connected
-                or pair[1].reply_to_message_id in connected
-                or any(n.reply_to_message_id == pair[1].message_id for n in nodes.values())
-            )
-        ]
-        if not selected:
-            break
-        for pair in selected:
-            remaining.remove(pair)
-            node = pair[1]
-            connected.add(node.message_id)
-            if node.reply_to_message_id:
-                connected.add(node.reply_to_message_id)
-            ordered.append(node)
-    ordered.extend(node for _, node in remaining)
-    for node in ordered:
-        if node.message_id in nodes:
-            # A cached explicit source can gain its real author ID and reply edge.
-            old = nodes[node.message_id]
-            nodes[node.message_id] = replace(
-                old,
-                author_id=node.author_id,
-                reply_to_message_id=node.reply_to_message_id,
-                text=node.text if node.kind == "summary" else old.text,
-                kind=node.kind if node.kind == "summary" else old.kind,
-            )
-            continue
-        if budget <= 0 or len(nodes) >= 100:
-            break
-        text = node.text
-        if len(text) > min(budget, 2000):
-            text = text[: max(0, min(budget, 2000) - 1)] + "…"
-        budget -= len(text)
-        nodes[node.message_id] = replace(node, text=text)
-        # A participant may reply to a bot/caption or an older source which was
-        # never collected as ambient history. Keep that explicit edge intelligible.
-        ref = ambient_references.get(node.message_id)
-        if ref and ref.reply_to_message_id not in nodes and budget > 0 and len(nodes) < 100:
-            text = ref.text[: min(budget, 2000)]
-            budget -= len(text)
-            nodes[ref.reply_to_message_id] = DialogueMessage(
-                ref.reply_to_message_id,
-                ref.author_id,
-                ref.author_name,
-                ref.author_username,
-                ref.kind,
-                text,
-                unavailable_reason=ref.unavailable_reason,
-            )
+            following.append(target_id)
+        frontier = following
 
     groups: dict[tuple[str, int], tuple[DialogueMessage | None, list[int]]] = {}
     for mid in focus_ids:
@@ -201,6 +154,20 @@ def shared_dialogue(
         if group not in groups:
             groups[group] = (target, [])
         groups[group][1].append(mid)
+
+    def branch_context(ids: list[int]) -> tuple[int, ...]:
+        selected: set[int] = set()
+        for mid in ids:
+            seen = {mid}
+            for _ in range(MAX_REPLY_DEPTH):
+                target_id = nodes[mid].reply_to_message_id
+                if target_id is None or target_id not in nodes or target_id in seen:
+                    break
+                seen.add(target_id)
+                selected.add(target_id)
+                mid = target_id
+        return tuple(sorted(selected - set(ids)))
+
     branches = tuple(
         DialogueBranch(
             f"b{index}",
@@ -209,6 +176,7 @@ def shared_dialogue(
             target.author_username if target else None,
             tuple(ids),
             target is not None,
+            branch_context(ids),
         )
         for index, (target, ids) in enumerate(groups.values(), 1)
     )
@@ -217,5 +185,4 @@ def shared_dialogue(
         tuple(sorted(nodes.values(), key=lambda n: n.message_id)),
         branches,
         partial,
-        has_previous_summary,
     )

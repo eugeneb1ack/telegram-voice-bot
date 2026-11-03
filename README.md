@@ -10,18 +10,20 @@ Telegram bot for voice messages.
 
 ## Conversation context
 
-A typing indicator runs during processing. Each author's third, sixth and ninth
-voice receives one reply containing the cumulative series summary and the full
-collapsible transcript of the current recording. The third covers voices 1–3;
-the sixth connects the previous recap to a full summary of voices 4–6. Earlier
-context gets at most one sentence (240 characters); the main detail budget belongs
-to new messages. The connection is omitted when topics change. Successful summaries
-mark sources as covered; failed summaries retain their sources for the next scheduled
-summary. Each update keeps the same structure and detail for new material. The first two short voices receive transcripts only. A
+A typing indicator runs during processing. Each new block of three voices by one
+author receives one reply with that block's summary and the current recording's
+full collapsible transcript. Both the third and sixth replies say “Коротко · 3
+голосовых”; the latter covers voices 4–6. The author's text between those voices
+also belongs to the block. Earlier text, other participants' messages and previous
+aggregate summaries are not added automatically. A failed summary does not merge
+its old block into the next one: complete transcripts are already delivered and
+remain available as explicit reply sources. The first two short voices receive
+transcripts only. A
 recording of at least 30 seconds gets an immediate summary at any position in a
 series. Pending shorter recordings are included with it, so they cannot disappear. After a
-successful standalone summary, count three new voices; its existing recap becomes
-background only. A long first voice plus two short ones therefore produces no
+successful standalone summary, count three new voices. Earlier recordings provide
+background only through explicit replies, using their own transcript rather than
+an aggregate recap. A long first voice plus two short ones therefore produces no
 second summary on message three: the new triple completes on message four. A failed
 standalone summary does not mark the recording as summarized. Forwarded
 batches remain separate. Round video notes count as voices and contribute speech
@@ -33,14 +35,19 @@ Text does not extend the boundary. `CONTEXT_SERIES_GAP_SECONDS` (default 900) ca
 additionally limit silence between voices; `CONTEXT_TTL_SECONDS` caps total series
 length and ambient context age.
 
-Counters are per author; ambient history is shared only within the same chat and
-actual forum topic. The model receives attributed messages and exact reply edges,
-using existing transcripts, text and captions from the last 15 minutes. Other
-speakers clarify the focus author's words without becoming their statements.
-Replies to different recipients get separate sections; unaddressed messages remain
-separate. An explicit reply to an old source can clarify that answer without
-loading the entire older conversation. Telegram IDs identify people; display names
-are preferred over usernames in labels.
+Counters are per author, chat and actual forum topic. Background is selected by
+explicit reply ancestry: the direct target plus at most two earlier ancestors
+already available in memory. Neighbouring messages, sibling replies, the same
+recipient and temporal proximity do not establish a connection. Without a reply,
+the new block stands alone. An explicit old source is allowed without loading its
+surrounding history.
+
+Each branch carries the exact IDs of its primary messages and eligible context.
+Other speakers' text, captions and existing transcripts clarify that answer without
+becoming the author's statements. Different recipients get separate sections;
+unaddressed messages remain separate. Telegram IDs identify people; display names
+are preferred over usernames. Selection runs locally, without another model request
+or re-transcribing cached audio.
 
 Defaults: 12 messages and 12,000 characters per author, at most 200 active contexts.
 Shared background has one additional 12,000-character budget and at most 100 nodes,
@@ -52,18 +59,18 @@ Telegram transcripts stay complete. Forwarded messages have separate scope; priv
 Only received Telegram updates are used; old chat history is never fetched.
 
 The first two short replies do not wait for an uncached older reply source to be
-transcribed. Its bounded media metadata persists until the cumulative summary and
+transcribed. Its bounded media metadata persists until the block summary and
 survives restarts. Existing transcripts are reused. A summary can still take longer
 when its older source has never been recognized.
 
 Unprocessed voices and delivery progress persist in a SQLite journal. A context snapshot
-failure disables cumulative summaries; a queue journal failure stops polling before
+failure disables block summaries; a queue journal failure stops polling before
 acknowledging further updates. Summaries use the same queue and delivery deduplication as ordinary transcripts.
 If the combined result exceeds Telegram’s limit, it is split while preserving the
 entire transcript.
 
 See `CONTEXT_*` in [.env.example](.env.example). `CONTEXT_SUMMARY_EVERY=0` disables
-cumulative summaries; `CONTEXT_TTL_SECONDS=0` disables context collection entirely.
+block summaries; `CONTEXT_TTL_SECONDS=0` disables context collection entirely.
 When upgrading, change an explicitly configured `CONTEXT_MAX_CHARS=800` to `12000`.
 
 ## Explicit reply context
