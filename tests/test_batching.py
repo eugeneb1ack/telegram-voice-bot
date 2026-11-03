@@ -14,6 +14,7 @@ def forwarded(index, sender=1, chat=1, topic=0, seconds=0):
         forward_origin=object(),
         chat=SimpleNamespace(id=chat),
         message_thread_id=topic,
+        is_topic_message=bool(topic),
     )
 
 

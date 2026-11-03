@@ -17,6 +17,7 @@ from aiogram import Bot
 from aiogram.types import Message
 
 from voice_bot.deduplication import voice_keys
+from voice_bot.reply_context import reply_target
 
 
 class JournalUnavailable(Exception):
@@ -54,7 +55,7 @@ def request_key(message: Message, requester: Message | None = None) -> str:
     return key
 
 
-def pack(message: Message) -> dict[str, Any]:
+def pack(message: Message, *, include_reply: bool = True) -> dict[str, Any]:
     # Keep only fields needed for processing/reply routing, never unrelated nested history.
     fields = {
         "message_id",
@@ -63,6 +64,8 @@ def pack(message: Message) -> dict[str, Any]:
         "from_user",
         "sender_chat",
         "voice",
+        "video",
+        "video_note",
         "message_thread_id",
         "is_topic_message",
         "forward_origin",
@@ -70,14 +73,15 @@ def pack(message: Message) -> dict[str, Any]:
         "ephemeral_message_id",
     }
     data = message.model_dump(mode="json", include=fields, exclude_none=True)
-    reply = message.reply_to_message
-    if reply is not None and (reply.text or reply.caption):
-        data["reply_to_message"] = {
-            "message_id": reply.message_id,
-            "date": reply.date.timestamp(),
-            "chat": {"id": reply.chat.id, "type": reply.chat.type},
-            "text": (reply.text or reply.caption or "")[:1000],
-        }
+    if not include_reply:
+        if message.text:
+            data["text"] = message.text[:8000]
+        if message.caption:
+            data["caption"] = message.caption[:8000]
+    else:
+        target = reply_target(message)
+        if target is not None:
+            data["reply_to_message"] = pack(target, include_reply=False)
     return data
 
 

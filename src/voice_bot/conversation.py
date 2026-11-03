@@ -15,6 +15,8 @@ from typing import Literal
 
 from pydantic import TypeAdapter, ValidationError
 
+from voice_bot.reply_context import ReplyContext, bounded_contexts
+
 logger = logging.getLogger(__name__)
 ConversationKey = tuple[int, ...]  # chat, topic, author; optional forwarding scope
 
@@ -26,6 +28,7 @@ class Entry:
     text: str
     kind: Literal["voice", "text"] = "voice"
     duration_seconds: int = 0
+    reply_contexts: tuple[ReplyContext, ...] = ()
 
 
 @dataclass
@@ -133,6 +136,16 @@ class ConversationMemory:
             and not set(entry.message_ids).intersection(message_ids)
         )
 
+    def source(self, chat_id: int, message_id: int) -> str | None:
+        """Read only the exact public message explicitly referenced in this chat."""
+        self.purge()
+        for key, session in self.sessions.items():
+            if key[0] == chat_id:
+                for entry in session.entries:
+                    if entry.message_ids == (message_id,):
+                        return entry.text
+        return None
+
     def remember(
         self,
         key: ConversationKey | None,
@@ -143,6 +156,7 @@ class ConversationMemory:
         kind: Literal["voice", "text"] = "voice",
         duration_seconds: int = 0,
         anchor: Anchor | None = None,
+        reply_contexts: tuple[ReplyContext, ...] = (),
     ) -> None:
         self.purge()
         if key is None or not self.ttl or not text.strip() or not self.available:
@@ -159,7 +173,9 @@ class ConversationMemory:
         if session is None:
             session = Session(expires_at=self.clock() + self.ttl)
             self.sessions[key] = session
-        session.entries.append(Entry(message_ids, sent_at, text, kind, duration_seconds))
+        session.entries.append(
+            Entry(message_ids, sent_at, text, kind, duration_seconds, reply_contexts)
+        )
         session.entries.sort(key=lambda e: (e.sent_at, max(e.message_ids)))
         self._trim(session)
         session.expires_at = self.clock() + self.ttl
@@ -185,13 +201,23 @@ class ConversationMemory:
             limit = min(budget, self.max_chars // 2)
             if limit < 1:
                 break
+            reply_contexts = bounded_contexts(entry.reply_contexts, limit // 3)
+            reply_chars = sum(len(context.text) for context in reply_contexts)
+            text_limit = limit - reply_chars
             text = entry.text
-            if len(text) > limit:
-                text = text[: max(0, limit - 1)] + "…"
+            if len(text) > text_limit:
+                text = text[: max(0, text_limit - 1)] + "…"
             result.append(
-                Entry(entry.message_ids, entry.sent_at, text, entry.kind, entry.duration_seconds)
+                Entry(
+                    entry.message_ids,
+                    entry.sent_at,
+                    text,
+                    entry.kind,
+                    entry.duration_seconds,
+                    reply_contexts,
+                )
             )
-            budget -= len(text)
+            budget -= len(text) + reply_chars
         session.entries = list(reversed(result))
 
     def purge(self) -> None:

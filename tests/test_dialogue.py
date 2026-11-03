@@ -133,6 +133,7 @@ async def test_conversation_does_not_mix_scopes(settings, separation):
         third.from_user = identified_message(3, author=444).from_user
     elif separation == "topic":
         third.message_thread_id = 7
+        third.is_topic_message = True
     elif separation == "chat":
         third.chat.id = 555
     elif separation == "private":
@@ -295,6 +296,7 @@ async def test_many_interleaved_chats_topics_and_authors_never_mix_sources(setti
         message = identified_message(base + 3, duration=10, author=key[2], seconds=45)
         message.chat.id = key[0]
         message.message_thread_id = key[1] or None
+        message.is_topic_message = bool(key[1])
         message.from_user = User(id=key[2], first_name="Одинаковое имя", is_bot=False)
         messages.append(message)
 
