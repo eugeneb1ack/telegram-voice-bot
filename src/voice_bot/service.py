@@ -728,11 +728,15 @@ class VoiceService:
         target = reply_target(message)
         if target is None:
             return None
+        kind = media_kind(target)
+        if kind is None:
+            return None
         cache_key = "reply-context:" + voice_keys(message)[0]
         cached = self._result_get(cache_key)
         if cached is not None:
-            return ReplyContext(**json.loads(cached))
-        kind = media_kind(target)
+            saved = ReplyContext(**json.loads(cached))
+            if saved.kind == kind and saved.reply_to_message_id == target.message_id:
+                return saved
         previous = self.memory.reply_source(message.chat.id, target.message_id)
         if kind != "text" and previous is not None and previous.kind == kind:
             author = summary_context(target)

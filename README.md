@@ -42,7 +42,9 @@ When upgrading, change an explicitly configured `CONTEXT_MAX_CHARS=800` to `1200
 ## Explicit reply context
 
 When a voice replies to another message, summaries use that exact source as background:
-text, voice, or speech from a video/video note. The source is attributed separately from
+text, captions (including bot messages), voice, or speech from a round video note.
+Ordinary videos and other attachments contribute only their textual captions; the
+attachment itself is never downloaded or transcribed for context. The source is attributed separately from
 the author's own words. A reply on the first or second voice remains available for the
 third voice's summary, including after restart. It does not increment the author's
 voice counter and is not appended to the transcript. The next triple does not inherit
@@ -53,10 +55,10 @@ sources are excluded; no surrounding history of the other participant is fetched
 An explicit reference across forum topics may provide background, while each topic's
 voice counter remains separate. Ordinary reply chains are not forum topics.
 
-Existing source transcripts are reused. If speech from the referenced voice/video has
+Existing source transcripts are reused. If speech from the referenced voice/video note has
 not been recognized yet, it uses the same bounded download, FFmpeg and STT path inside
 the current job. Additional context work has a 45-second ceiling and reserves time
-for the summary. Videos contribute speech only, not visual interpretation. Unavailable
+for the summary. Video notes contribute speech only, not visual interpretation. Unavailable
 or oversized sources do not prevent delivery of the author's transcript; the summary
 must not invent missing context. No models have changed.
 
@@ -150,8 +152,8 @@ sent anonymously on behalf of the group are not processed. See [Telegram's ephem
 Requires Linux, Git, Docker Engine and Docker Compose v2. No inbound ports are needed.
 
 ```bash
-git clone https://github.com/eugeneb1ack/telegram-voice-bot.git
-cd telegram-voice-bot
+git clone https://github.com/eugeneb1ack/voice-bot.git
+cd voice-bot
 test -e .env || cp .env.example .env
 chmod 600 .env
 ```

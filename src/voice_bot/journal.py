@@ -64,7 +64,6 @@ def pack(message: Message, *, include_reply: bool = True) -> dict[str, Any]:
         "from_user",
         "sender_chat",
         "voice",
-        "video",
         "video_note",
         "message_thread_id",
         "is_topic_message",

@@ -21,7 +21,7 @@ def foreign_message(*, chat=-100, kind="text", duration=15, size=100):
         "duration": duration,
         "file_size": size,
     }
-    if kind == "video":
+    if kind in {"video", "animation", "photo"}:
         media.update(width=320, height=240)
     elif kind == "video_note":
         media.update(length=240)
@@ -34,7 +34,7 @@ def foreign_message(*, chat=-100, kind="text", duration=15, size=100):
     if kind == "text":
         data["text"] = FOREIGN_TEXT
     else:
-        data[kind] = media
+        data[kind] = [media] if kind == "photo" else media
     return Message.model_validate(data)
 
 
@@ -155,7 +155,7 @@ async def test_exact_saved_source_is_reused_without_another_transcription(settin
         await service.close()
 
 
-@pytest.mark.parametrize("kind", ["video", "video_note"])
+@pytest.mark.parametrize("kind", ["voice", "video_note"])
 async def test_media_reply_uses_bounded_audio_path_and_cleans_files(settings, kind):
     service, bot, paths = setup(settings)
     target = foreign_message(kind=kind)
@@ -177,7 +177,7 @@ async def test_media_reply_uses_bounded_audio_path_and_cleans_files(settings, ki
         await service.close()
 
 
-@pytest.mark.parametrize("kind", ["video", "video_note"])
+@pytest.mark.parametrize("kind", ["voice", "video_note"])
 @pytest.mark.parametrize("limit", ["duration", "size"])
 async def test_media_reply_limits_skip_download_without_failing_main_voice(settings, kind, limit):
     service, bot, _ = setup(settings)
@@ -199,7 +199,7 @@ async def test_media_reply_limits_skip_download_without_failing_main_voice(setti
         await service.close()
 
 
-@pytest.mark.parametrize("kind", ["text", "voice", "video", "video_note"])
+@pytest.mark.parametrize("kind", ["text", "voice", "video_note"])
 def test_journal_packs_only_one_reply_level_and_preserves_target_metadata(kind):
     target = foreign_message(kind=kind)
     nested = foreign_message(chat=-200).model_copy(update={"message_id": 999, "text": "Не хранить"})
@@ -341,7 +341,7 @@ def test_legacy_reply_without_author_or_privacy_metadata_is_not_reused():
 
 async def test_saved_media_reply_source_is_reused_for_new_reply_after_restart(settings):
     service, bot, _ = setup(settings)
-    target = foreign_message(kind="video")
+    target = foreign_message(kind="video_note")
     first = reply_voice(10, target)
     service.transcriber.transcribe.return_value = FOREIGN_TEXT
     reference = await service._reply_context(first, bot)
@@ -358,14 +358,142 @@ async def test_saved_media_reply_source_is_reused_for_new_reply_after_restart(se
     await service.close()
     restarted, bot, _ = setup(settings)
     try:
-        second = reply_voice(11, foreign_message(kind="video"))
+        second = reply_voice(11, foreign_message(kind="video_note"))
         recovered = await restarted._reply_context(second, bot)
         assert recovered is not None and recovered.text == FOREIGN_TEXT
         assert recovered.message_id == 11 and recovered.reply_to_message_id == 1
         assert recovered.author_name == "Ирина" and recovered.author_username == "irina"
-        assert recovered.kind == "video" and recovered.unavailable_reason is None
+        assert recovered.kind == "video_note" and recovered.unavailable_reason is None
         restarted.transcriber.transcribe.assert_not_awaited()
         bot.get_file.assert_not_awaited()
         bot.download_file.assert_not_awaited()
     finally:
         await restarted.close()
+
+
+def real_reply_voice(*, target=None, external=None):
+    return Message.model_validate(
+        {
+            "message_id": 10,
+            "date": datetime(2026, 1, 1, tzinfo=UTC),
+            "chat": {"id": -100, "type": "supergroup"},
+            "from_user": {"id": 222, "is_bot": False, "first_name": "Автор"},
+            "voice": {"file_id": "own", "file_unique_id": "own-unique", "duration": 10},
+            "reply_to_message": target,
+            "external_reply": external,
+        }
+    )
+
+
+@pytest.mark.parametrize("kind", ["video", "document", "audio", "animation", "photo"])
+@pytest.mark.parametrize("cached", [False, True])
+async def test_attachment_captions_are_text_only_even_with_cached_video(settings, kind, cached):
+    import json
+    from dataclasses import asdict, replace
+
+    from voice_bot.deduplication import voice_keys
+    from voice_bot.reply_context import ReplyContext
+
+    service, bot, _ = setup(settings)
+    target = foreign_message(kind=kind).model_copy(update={"caption": FOREIGN_TEXT})
+    message = real_reply_voice(target=target)
+    if cached:
+        # Simulate a result cached before ordinary videos were explicitly excluded.
+        reference = ReplyContext(10, 1, "Ирина", "irina", "video", "ЗАПРЕЩЁННАЯ РЕЧЬ ВИДЕО")
+        service.results.put(
+            "reply-context:" + voice_keys(message)[0], json.dumps(asdict(reference))
+        )
+        key = (-100, 0, 222)
+        service.memory.remember(key, message.date.timestamp(), (10,), "Собственная мысль.")
+        session = service.memory.sessions[key]
+        session.entries[0] = replace(session.entries[0], reply_contexts=(reference,))
+    try:
+        assert reply_target(message) is not None
+        assert as_voice(target) is None
+        context = await service._reply_context(message, bot)
+        assert context is not None and context.kind == "text"
+        assert context.text == FOREIGN_TEXT
+        assert context.message_id == 10 and context.reply_to_message_id == 1
+        assert "ЗАПРЕЩЁННАЯ РЕЧЬ ВИДЕО" not in context.text
+        bot.get_file.assert_not_awaited()
+        bot.download_file.assert_not_awaited()
+        service.transcriber.transcribe.assert_not_awaited()
+        service.summarizer.summarize.assert_not_awaited()
+        packed = pack(message)
+        assert "reply_to_message" in packed and "external_reply" not in packed
+        restored = Message.model_validate(packed).reply_to_message
+        assert restored is not None and (restored.text or restored.caption) == FOREIGN_TEXT
+        assert all(
+            getattr(restored, field, None) is None
+            for field in ("video", "document", "audio", "animation", "photo")
+        )
+        assert "foreign-file" not in str(packed)
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize("kind", ["video", "document", "audio", "animation", "photo"])
+async def test_external_unsupported_media_is_not_reinterpreted_as_text(settings, kind):
+    service, bot, _ = setup(settings)
+    target = foreign_message(kind=kind)
+    external = {
+        "origin": {"type": "user", "date": target.date, "sender_user": target.from_user},
+        "chat": target.chat,
+        "message_id": target.message_id,
+        kind: getattr(target, kind),
+    }
+    message = real_reply_voice(external=external)
+    try:
+        assert message.reply_to_message is None
+        assert reply_target(message) is None
+        assert await service._reply_context(message, bot) is None
+        bot.get_file.assert_not_awaited()
+        bot.download_file.assert_not_awaited()
+        service.transcriber.transcribe.assert_not_awaited()
+        packed = pack(message)
+        assert "reply_to_message" not in packed and "external_reply" not in packed
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize("kind", ["video", "document", "audio", "animation", "photo"])
+async def test_attachment_without_caption_is_excluded_from_reply_context(settings, kind):
+    service, bot, _ = setup(settings)
+    message = real_reply_voice(target=foreign_message(kind=kind))
+    try:
+        assert reply_target(message) is None
+        assert await service._reply_context(message, bot) is None
+        bot.get_file.assert_not_awaited()
+        bot.download_file.assert_not_awaited()
+        service.transcriber.transcribe.assert_not_awaited()
+        packed = pack(message)
+        assert "reply_to_message" not in packed and "external_reply" not in packed
+        assert "foreign-file" not in str(packed)
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize("kind", ["text", "document"])
+async def test_explicit_bot_text_or_attachment_caption_is_supported_without_stt(settings, kind):
+    service, bot, _ = setup(settings)
+    target = foreign_message(kind=kind)
+    target = target.model_copy(
+        update={
+            "from_user": User(id=555, is_bot=True, first_name="Ответчик", username="reply_bot"),
+            "caption": FOREIGN_TEXT if kind == "document" else None,
+        }
+    )
+    message = real_reply_voice(target=target)
+    try:
+        context = await service._reply_context(message, bot)
+        assert context is not None and context.kind == "text" and context.text == FOREIGN_TEXT
+        assert context.author_name == "Ответчик" and context.author_username == "reply_bot"
+        bot.get_file.assert_not_awaited()
+        bot.download_file.assert_not_awaited()
+        service.transcriber.transcribe.assert_not_awaited()
+        restored = Message.model_validate(pack(message)).reply_to_message
+        assert restored is not None and restored.from_user.is_bot
+        assert (restored.text or restored.caption) == FOREIGN_TEXT
+        assert restored.document is None
+    finally:
+        await service.close()
