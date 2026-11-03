@@ -4,7 +4,7 @@ import logging
 import random
 import time
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -14,6 +14,7 @@ from voice_bot.config import Settings
 from voice_bot.dialogue_graph import SharedDialogue
 from voice_bot.errors import NoSpeechError, ProviderError
 from voice_bot.reply_context import ReplyContext
+from voice_bot.semantic_context import select_continuations
 from voice_bot.stt_context import bounded_keywords
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,10 @@ class HTTPSummarizer:
         settings = self.api.settings
         if len(transcript) > settings.summary_max_input_chars:
             raise ProviderError("Текст слишком длинный для настроенного лимита summary.")
+        if context and context.dialogue is not None:
+            context = replace(
+                context, dialogue=await select_continuations(self.api, context.dialogue)
+            )
         instructions = (
             "Сделай понятный пересказ смысла голосовых. Язык ответа: "
             f"{settings.summary_language}. "
@@ -341,6 +346,8 @@ class HTTPSummarizer:
                 "Его НОВЫЕ реплики распределены приложением по branches.message_ids. "
                 "Для каждой ветки используй только её message_ids как материал пересказа, "
                 "а context_message_ids — только для пояснения отсылок этой ветки. "
+                "Смысловой контекст не доказывает адресата. "
+                "Обрезанные источники с … не достраивай. "
                 "Сообщения остальных веток не добавляй в неё и не дублируй под «Дополнительно». "
                 "kind=summary — уже опубликованный пересказ предыдущих записей: "
                 "это только фон для новых реплик, не пересказывай его отдельным тезисом заново. "
@@ -379,7 +386,9 @@ class HTTPSummarizer:
             metadata = asdict(context)
             for field in ("dialogue", "recent_summaries", "reply_contexts", "reply_to_text"):
                 metadata.pop(field, None)
-            data = {"context": metadata, "dialogue": asdict(dialogue)}
+            selected_dialogue = asdict(dialogue)
+            selected_dialogue.pop("candidates", None)
+            data = {"context": metadata, "dialogue": selected_dialogue}
             fields: dict[str, dict[str, Any]] = {
                 branch.branch_id: {"type": "string"} for branch in dialogue.branches
             }

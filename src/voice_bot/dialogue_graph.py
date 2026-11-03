@@ -1,6 +1,6 @@
 """A bounded shared conversation, with explicit authors and reply edges."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from voice_bot.conversation import ConversationKey, ConversationMemory, Entry
 from voice_bot.reply_context import ReplyContext
@@ -38,6 +38,8 @@ class SharedDialogue:
     branches: tuple[DialogueBranch, ...]
     partial: bool = False
     has_previous_summary: bool = False
+    # Quarantined: candidates are never summary sources before semantic selection.
+    candidates: tuple[DialogueMessage, ...] = ()
 
 
 def shared_dialogue(
@@ -180,9 +182,48 @@ def shared_dialogue(
         )
         for index, (target, ids) in enumerate(groups.values(), 1)
     )
+    eligible: list[DialogueMessage] = []
+    if any(nodes[mid].reply_to_message_id is None for mid in focus_ids):
+        # A no-reply continuation may refer to a source already attached to another
+        # current voice. Keep that source eligible without inventing a reply edge.
+        candidate_pool = {
+            **candidates,
+            **{mid: n for mid, n in nodes.items() if mid not in focus_ids},
+        }
+        recent = sorted(
+            candidate_pool.values(),
+            key=lambda n: (n.message_id in nodes, n.message_id),
+            reverse=True,
+        )
+        own_recent = [n for n in recent if n.author_id == key[2]]
+        others = [n for n in recent if n.author_id != key[2]]
+        limit = min(memory.max_chars, 6000)
+        own_budget = limit * 2 // 3 if others else limit
+        for pool, chars in ((own_recent, own_budget), (others, limit - own_budget)):
+            authors: dict[int | None, int] = {}
+            selected = 0
+            excerpt_limit = min(1000, chars // max(1, min(6, len(pool))))
+            for node in pool:
+                if not node.text.strip() or selected >= 6 or chars <= 0:
+                    continue
+                if node.author_id != key[2] and authors.get(node.author_id, 0) >= 2:
+                    continue
+                allowance = chars if node.message_id in nodes else min(chars, budget)
+                excerpt = node.text[: min(allowance, excerpt_limit)]
+                if not excerpt:
+                    continue
+                if len(excerpt) < len(node.text):
+                    excerpt = excerpt[:-1] + "…"
+                eligible.append(replace(node, text=excerpt))
+                chars -= len(excerpt)
+                if node.message_id not in nodes:
+                    budget -= len(excerpt)
+                selected += 1
+                authors[node.author_id] = authors.get(node.author_id, 0) + 1
     return SharedDialogue(
         key[2],
         tuple(sorted(nodes.values(), key=lambda n: n.message_id)),
         branches,
         partial,
+        candidates=tuple(sorted(eligible, key=lambda n: n.message_id)),
     )

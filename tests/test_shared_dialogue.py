@@ -99,7 +99,7 @@ def test_twenty_unlinked_participants_keep_separate_counts_and_sources(settings)
 
 async def test_hard_window_restarts_even_with_continuous_activity(settings):
     service, bot, _ = setup(settings)
-    for mid, seconds in [(1, 0), (2, 400), (3, 800), (4, 900), (5, 1300), (6, 1700)]:
+    for mid, seconds in [(1, 0), (2, 200), (3, 400), (4, 420), (5, 620), (6, 820)]:
         last = await voice(service, bot, mid, seconds=seconds)
         assert ("Коротко · 3 голосовых:" in last.answer.await_args.args[0]) == (mid in (3, 6))
     call = service.summarizer.summarize.await_args
@@ -307,6 +307,7 @@ async def test_structured_summary_exact_branches_and_deterministic_names(
     graph = branch_fixture()
     graph = replace(
         graph,
+        candidates=(),
         has_previous_summary=previous,
         branches=(
             graph.branches[0],
