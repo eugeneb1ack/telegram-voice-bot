@@ -152,8 +152,8 @@ sent anonymously on behalf of the group are not processed. See [Telegram's ephem
 Requires Linux, Git, Docker Engine and Docker Compose v2. No inbound ports are needed.
 
 ```bash
-git clone https://github.com/eugeneb1ack/voice-bot.git
-cd voice-bot
+git clone https://github.com/eugeneb1ack/telegram-voice-bot.git
+cd telegram-voice-bot
 test -e .env || cp .env.example .env
 chmod 600 .env
 ```

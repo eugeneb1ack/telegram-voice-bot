@@ -157,8 +157,8 @@ RAM-очередь успела завершиться: задания стар�
 Нужны Linux, Git, Docker Engine и Docker Compose v2. Входящие порты не используются.
 
 ```bash
-git clone https://github.com/eugeneb1ack/voice-bot.git
-cd voice-bot
+git clone https://github.com/eugeneb1ack/telegram-voice-bot.git
+cd telegram-voice-bot
 test -e .env || cp .env.example .env
 chmod 600 .env
 ```
