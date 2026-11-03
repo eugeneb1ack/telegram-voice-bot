@@ -29,10 +29,11 @@ from voice_bot.admin import GroupAdmin
 from voice_bot.audio import BoundedFile, convert_audio
 from voice_bot.batching import VoiceBatcher, batch_key
 from voice_bot.config import Settings
-from voice_bot.conversation import Anchor, ConversationKey, ConversationMemory, Session
+from voice_bot.conversation import Anchor, ConversationKey, ConversationMemory, Entry, Session
 from voice_bot.deduplication import ProcessedVoices, RecentResults, voice_keys
 from voice_bot.delivery import ephemeral, forum_topic_id, recipient, reply_to
 from voice_bot.dialogue import DialogueContext, DialogueInput
+from voice_bot.dialogue_graph import shared_dialogue
 from voice_bot.errors import NoSpeechError, ProviderError, RecognitionError, UserFacingError
 from voice_bot.jobs import VoiceJobQueue
 from voice_bot.journal import DeliveryUncertain, QueueJournal, request_key
@@ -1156,8 +1157,7 @@ class VoiceService:
                     context = summary_context(messages[0])
                     context = replace(
                         context,
-                        # A recent message is not necessarily part of this conversation.
-                        # Standalone summaries use only their exact reply source.
+                        # Unselected history must never enter the summary prompt.
                         recent_summaries=(),
                         reply_to_text=None,
                         reply_contexts=reply_contexts,
@@ -1171,6 +1171,32 @@ class VoiceService:
                             reply_contexts=dialogue.reply_contexts,
                             dialogue=dialogue.shared,
                         )
+                    elif (
+                        not is_batch
+                        and key is not None
+                        and len(key) == 3
+                        and key in self.memory.sessions
+                        and self.memory.available
+                    ):
+                        graph = shared_dialogue(
+                            self.memory,
+                            key,
+                            [
+                                Entry(
+                                    (message.message_id,),
+                                    min(times),
+                                    transcript,
+                                    "voice",
+                                    message.voice.duration,
+                                    reply_contexts,
+                                )
+                            ],
+                            reply_contexts,
+                            min(times),
+                            message.message_id,
+                        )
+                        if graph.candidates:
+                            context = replace(context, dialogue=graph)
                     if is_batch:
                         if reply_contexts:
                             summary_input = "\n\n".join(
@@ -1268,7 +1294,7 @@ class VoiceService:
             series = self.memory.series_at(key, sent_at)
             if series is not None and not series.voice_count:
                 # Admission provisionally opens a window. Silence must not start
-                # the fifteen-minute window for the first actual spoken message.
+                # the series window for the first actual spoken message.
                 self.memory.sessions[key].series.remove(series)
                 changed = True
         if changed:

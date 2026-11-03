@@ -31,32 +31,43 @@ transcripts only. A
 recording of at least 30 seconds gets an immediate summary at any position in a
 series. Pending shorter recordings are included with it, so they cannot disappear. After a
 successful standalone summary, count three new voices. Earlier recordings provide
-background only through explicit replies, using their own transcript rather than
-an aggregate recap. A long first voice plus two short ones therefore produces no
+background through explicit replies or verified semantic continuation, using their
+own transcript rather than an aggregate recap. A long first voice plus two short ones therefore produces no
 second summary on message three: the new triple completes on message four. A failed
 standalone summary does not mark the recording as summarized. Forwarded
 batches remain separate. Round video notes count as voices and contribute speech
 only. Ordinary video files are not transcribed; their captions can supply text.
 
-A series spans at most 15 minutes from its first voice. The counter restarts at
+A series spans at most 7 minutes from its first voice. The counter restarts at
 that boundary: two voices followed by a third two hours later never form a triple.
-Text does not extend the boundary. `CONTEXT_SERIES_GAP_SECONDS` (default 900) can
+Text does not extend the boundary. `CONTEXT_SERIES_GAP_SECONDS` (default 420) can
 additionally limit silence between voices; `CONTEXT_TTL_SECONDS` caps total series
 length and ambient context age.
 
 Counters are per author, chat and actual forum topic. Background is selected by
 explicit reply ancestry: the direct target plus at most two earlier ancestors
 already available in memory. Neighbouring messages, sibling replies, the same
-recipient and temporal proximity do not establish a connection. Without a reply,
-the new block stands alone. An explicit old source is allowed without loading its
-surrounding history.
+recipient and temporal proximity alone do not establish a connection. An explicit
+old source is allowed without loading its surrounding history.
+
+Without a reply, a separate bounded semantic selection precedes summary generation:
+at most 12 candidates from the same chat/topic within 7 minutes, 6,000 characters
+total. Existing transcripts, text and captions may clarify a specific reference,
+continuation, correction or answer; a broad shared topic is insufficient. Source IDs,
+chronology and verbatim evidence quotes are validated. Ambiguous links are dropped.
+The summary request sees at most three selected sources; rejected candidates never
+reach it. Explicit replies take priority, and inferred continuity never invents a recipient.
 
 Each branch carries the exact IDs of its primary messages and eligible context.
 Other speakers' text, captions and existing transcripts clarify that answer without
 becoming the author's statements. Different recipients get separate sections;
 unaddressed messages remain separate. Telegram IDs identify people; display names
-are preferred over usernames. Selection runs locally, without another model request
-or re-transcribing cached audio.
+are preferred over usernames. Semantic selection uses the configured summary model
+only before a summary with available candidates. The first two short voices do not
+wait for it. It has a four-second timeout; failure falls back to current messages and
+explicit replies. Cached audio is never re-transcribed for context. Semantic selection
+is probabilistic: validated evidence reduces risk but cannot guarantee perfect
+interpretation of ambiguous speech.
 
 Defaults: 12 messages and 12,000 characters per author, at most 200 active contexts.
 Shared background has one additional 12,000-character budget and at most 100 nodes,
@@ -78,7 +89,9 @@ acknowledging further updates. Summaries use the same queue and delivery dedupli
 If the combined result exceeds Telegram’s limit, it is split while preserving the
 entire transcript.
 
-See `CONTEXT_*` in [.env.example](.env.example). `CONTEXT_SUMMARY_EVERY=0` disables
+See `CONTEXT_*` in [.env.example](.env.example).
+When upgrading, replace explicitly configured `CONTEXT_TTL_SECONDS=900` and
+`CONTEXT_SERIES_GAP_SECONDS=900` with `420` for the seven-minute window. `CONTEXT_SUMMARY_EVERY=0` disables
 block summaries; `CONTEXT_TTL_SECONDS=0` disables context collection entirely.
 When upgrading, change an explicitly configured `CONTEXT_MAX_CHARS=800` to `12000`.
 
@@ -91,9 +104,10 @@ attachment itself is never downloaded or transcribed for context. The source is 
 the author's own words. A reply on the first or second voice remains available for the
 third voice's summary, including after restart. It does not increment the author's
 voice counter and is not appended to the transcript. The next triple does not inherit
-another person's source unless one of its messages explicitly replies to it again.
+another person's source automatically: a fresh reply or verified semantic continuation
+is required.
 
-Only the referenced message in the same chat is eligible. Other chats and ephemeral
+For explicit replies, the referenced message in the same chat is eligible. Other chats and ephemeral
 sources are excluded; no surrounding history of the other participant is fetched.
 An explicit reference across forum topics may provide background, while each topic's
 voice counter remains separate. Ordinary reply chains are not forum topics.
@@ -122,7 +136,7 @@ and content-free counting are omitted from the summary, with full transcripts pr
 
 `gpt-transcribe` receives up to 16 literal vocabulary hints (320 characters total)
 from the explicit reply, the recording's caption and up to three preceding messages
-from the same author, chat and forum topic within the 15-minute context window.
+from the same author, chat and forum topic within the 7-minute context window.
 Existing voice transcripts may contribute vocabulary; source audio is never reprocessed
 just to build hints. Typed spelling takes precedence over earlier speech recognition.
 Only available text is used: an unrecognized referenced recording is not downloaded
