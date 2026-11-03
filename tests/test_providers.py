@@ -135,7 +135,7 @@ async def test_summary_sends_context_as_data_not_instructions(settings):
         summary = await HTTPSummarizer(APIClient(client, settings)).summarize(
             "Я замёрзла на парковке.", context=context
         )
-    assert summary == "@anna замерзает на парковке."
+    assert summary == f"{context.author_name}: @anna замерзает на парковке."
 
 
 @pytest.mark.parametrize(
@@ -187,7 +187,7 @@ async def test_summary_detail_scales_with_material_without_dropping_batch_parts(
         result = await HTTPSummarizer(APIClient(client, settings)).summarize(
             transcript, context=context
         )
-    assert result == "Первый абзац.\n\nВторой абзац."
+    assert result == "Имя: Первый абзац.\n\nВторой абзац."
 
 
 @pytest.mark.parametrize("words", [4, 20, 40, 80])
