@@ -8,6 +8,15 @@ Telegram bot for voice messages.
 - Summarizes recordings.
 - Combines multiple forwarded voice messages into one transcript and summary.
 
+## Recordings without recognized speech
+
+Empty recordings and recognition failures produce no chat reply. They do not enter
+conversation context or advance the three-voice counter. Forwarded batches include
+only recognized speech, without failure notices for the remaining parts. An empty
+result is durably completed: restart does not repeat STT or send a reply. Technical
+failures are logged without speech content; an explicit retry remains possible after
+the existing cooldown.
+
 ## Conversation context
 
 A typing indicator runs during processing. Each new block of three voices by one

@@ -12,7 +12,7 @@ import httpx
 
 from voice_bot.config import Settings
 from voice_bot.dialogue_graph import SharedDialogue
-from voice_bot.errors import ProviderError
+from voice_bot.errors import NoSpeechError, ProviderError
 from voice_bot.reply_context import ReplyContext
 from voice_bot.stt_context import bounded_keywords
 
@@ -201,7 +201,7 @@ class HTTPTranscriber:
         if not isinstance(text, str):
             raise ProviderError("Сервис распознавания вернул некорректный ответ.")
         if not text.strip():
-            raise ProviderError("Не удалось распознать речь. Возможно, в записи тишина.")
+            raise NoSpeechError()
         return text
 
 
