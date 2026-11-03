@@ -33,7 +33,7 @@ from voice_bot.conversation import Anchor, ConversationKey, ConversationMemory, 
 from voice_bot.deduplication import ProcessedVoices, RecentResults, voice_keys
 from voice_bot.delivery import ephemeral, forum_topic_id, recipient, reply_to
 from voice_bot.dialogue import DialogueContext, DialogueInput
-from voice_bot.errors import ProviderError, UserFacingError
+from voice_bot.errors import NoSpeechError, ProviderError, RecognitionError, UserFacingError
 from voice_bot.jobs import VoiceJobQueue
 from voice_bot.journal import DeliveryUncertain, QueueJournal, request_key
 from voice_bot.limits import NoticeLimiter, SenderKey, sender_key
@@ -168,6 +168,7 @@ class VoiceService:
         self.replays = NoticeLimiter(sender_interval=3, chat_interval=1)
         self._quota_charged: set[str] = set()
         self._sent_ids: dict[str, tuple[int, ...]] = {}
+        self._silent_ids: set[str] = set()
         self._owners: dict[str, SenderKey] = {}
         self._pending_by_sender: Counter[SenderKey] = Counter()
         self._requesters: dict[str, Message] = {}
@@ -615,6 +616,7 @@ class VoiceService:
         self._requesters.clear()
         self._quota_charged.clear()
         self._sent_ids.clear()
+        self._silent_ids.clear()
         self.results.clear()
 
     async def _handle_messages(self, messages: list[Message], bot: Bot) -> None:
@@ -714,8 +716,11 @@ class VoiceService:
                         self.journal.set(job_id, "result", None)
                     completed = await self._process(messages, bot, key, times, deadline)
                 try:
+                    silent = [item for item in completed if voice_keys(item)[0] in self._silent_ids]
+                    await self.processed.complete(silent)
                     await self.processed.complete(
-                        completed, self._sent_ids.pop(voice_keys(message)[0], ())
+                        [item for item in completed if voice_keys(item)[0] not in self._silent_ids],
+                        self._sent_ids.pop(voice_keys(message)[0], ()),
                     )
                 except OSError:
                     # The result was delivered. Stop admitting paid work if receipts fail.
@@ -741,6 +746,7 @@ class VoiceService:
             self._sent_ids.pop(voice_keys(message)[0], None)
             completed_ids = {item.message_id for item in completed}
             for item in messages:
+                self._silent_ids.discard(voice_keys(item)[0])
                 self._release(item, failed=admitted and item.message_id not in completed_ids)
             if admitted:
                 self.active_jobs -= 1
@@ -805,6 +811,8 @@ class VoiceService:
         cache_key = "transcript:" + voice_keys(message, scoped=False)[-1]
         cached = self._result_get(cache_key)
         if cached is not None:
+            if not cached.strip():
+                raise NoSpeechError()
             return cached
         hint_key = "stt-keywords:" + voice_keys(message)[0]
         saved_hints = self._result_get(hint_key)
@@ -840,11 +848,21 @@ class VoiceService:
             logger.info("audio_converted message_id=%s", message.message_id)
             if not self.work_allowed(message):
                 raise UserFacingError("Обработка в этом чате отключена.")
-            transcript = (
-                await self.transcriber.transcribe(wav, keywords=hints)
-                if hints
-                else await self.transcriber.transcribe(wav)
-            )
+            try:
+                transcript = (
+                    await self.transcriber.transcribe(wav, keywords=hints)
+                    if hints
+                    else await self.transcriber.transcribe(wav)
+                )
+                if not transcript.strip():
+                    raise NoSpeechError()
+            except NoSpeechError:
+                # Empty is a durable negative result, not a failed delivery.
+                self._result_put(cache_key, "")
+                raise
+            except Exception as exc:
+                logger.warning("recognition_unavailable error_type=%s", type(exc).__name__)
+                raise RecognitionError() from None
             self._result_put(cache_key, transcript)
             logger.info("transcription_completed message_id=%s", message.message_id)
             return transcript
@@ -1034,7 +1052,6 @@ class VoiceService:
         needs_summary = (
             is_batch or message.voice.duration >= self.settings.summary_min_voice_seconds
         )
-        ids = tuple(item.message_id for item in messages)
         summary = (
             "Не удалось составить краткое содержание. Полная расшифровка ниже."
             if needs_summary
@@ -1045,6 +1062,7 @@ class VoiceService:
         completed_summary: str | None = None
         reply_contexts: tuple[ReplyContext, ...] = ()
         transcripts: list[str | None] = [None] * len(messages)
+        ignored = [False] * len(messages)
         failures = ["Не обработано: превышено время ожидания."] * len(messages)
         try:
             async with asyncio.timeout_at(deadline):
@@ -1058,6 +1076,13 @@ class VoiceService:
                         continue
                     try:
                         transcripts[index] = await self._transcribe(item, bot)
+                    except RecognitionError as exc:
+                        ignored[index] = isinstance(exc, NoSpeechError)
+                        logger.info(
+                            "voice_recognition_skipped message_id=%s no_speech=%s",
+                            item.message_id,
+                            ignored[index],
+                        )
                     except (UserFacingError, ProviderError) as exc:
                         if not is_batch:
                             raise
@@ -1069,6 +1094,8 @@ class VoiceService:
                         failures[index] = "Не удалось распознать запись."
                 if not self.work_allowed(message):
                     return []
+                if not any(part is not None for part in transcripts):
+                    return await self._silent_result(messages, ignored)
                 transcript = self._joined(transcripts, failures)
                 due = None
                 if not is_batch and transcripts[0] is not None:
@@ -1129,7 +1156,9 @@ class VoiceService:
                     context = summary_context(messages[0])
                     context = replace(
                         context,
-                        recent_summaries=self.memory.recent(key, min(times) if times else 0, ids),
+                        # A recent message is not necessarily part of this conversation.
+                        # Standalone summaries use only their exact reply source.
+                        recent_summaries=(),
                         reply_to_text=None,
                         reply_contexts=reply_contexts,
                     )
@@ -1150,6 +1179,7 @@ class VoiceService:
                                 for index, (item, part) in enumerate(
                                     zip(messages, transcripts, strict=True)
                                 )
+                                if part is not None
                             )
                         authors = [summary_context(item) for item in messages]
                         same_author = all(
@@ -1196,15 +1226,12 @@ class VoiceService:
                         logger.warning("summary_unavailable error_type=%s", type(exc).__name__)
         except TimeoutError:
             if not any(part is not None for part in transcripts):
-                raise
+                logger.warning("voice_recognition_timeout")
+                return await self._silent_result(messages, ignored)
             logger.warning("voice_job_timeout")
         if not self.work_allowed(message):
             return []
         transcript = self._joined(transcripts, failures)
-        if is_batch and all(part is None for part in transcripts):
-            summary = "Не удалось распознать записи. Причины указаны в общей расшифровке."
-        elif is_batch and any(part is None for part in transcripts):
-            summary = "Часть записей не обработана.\n\n" + (summary or "")
         title = (
             f"Коротко · {dialogue.voice_count} голосовых"
             + (" (доступная часть серии):" if dialogue.partial else ":")
@@ -1218,6 +1245,7 @@ class VoiceService:
             "transcript": transcript,
             "title": title,
             "valid": [part is not None for part in transcripts],
+            "ignored": ignored,
             "key": key,
             "times": times,
             "dialogue": dialogue is not None,
@@ -1227,12 +1255,35 @@ class VoiceService:
             self.journal.set(job_id, "result", prepared)
         return await self._deliver_prepared(messages, bot, prepared)
 
+    async def _silent_result(self, messages: list[Message], ignored: list[bool]) -> list[Message]:
+        job_id = self._durable_job.get()
+        if self.journal is not None and job_id is not None:
+            self.journal.set(job_id, "result", {"silent": True, "ignored": ignored})
+        changed = False
+        for item in messages:
+            position = conversation_position(item)
+            if position is None:
+                continue
+            key, sent_at = position
+            series = self.memory.series_at(key, sent_at)
+            if series is not None and not series.voice_count:
+                # Admission provisionally opens a window. Silence must not start
+                # the fifteen-minute window for the first actual spoken message.
+                self.memory.sessions[key].series.remove(series)
+                changed = True
+        if changed:
+            await self.memory.checkpoint()
+        # No-speech is complete; transient failures stay eligible for explicit retry.
+        return [item for item, done in zip(messages, ignored, strict=True) if done]
+
     async def _deliver_prepared(
         self, messages: list[Message], bot: Bot, prepared: dict[str, Any]
     ) -> list[Message]:
         message = messages[-1]
         if not self.work_allowed(message):
             return []
+        if prepared.get("silent"):
+            return await self._silent_result(messages, prepared["ignored"])
         sent_ids = await self._send_result(
             message,
             bot,
@@ -1244,6 +1295,13 @@ class VoiceService:
         if sent_ids is None:
             return []
         self._sent_ids[voice_keys(message)[0]] = sent_ids
+        self._silent_ids.update(
+            voice_keys(item)[0]
+            for item, ignored in zip(
+                messages, prepared.get("ignored", [False] * len(messages)), strict=True
+            )
+            if ignored
+        )
         logger.info("voice_job_delivered message_id=%s", message.message_id)
         key = tuple(prepared["key"]) if prepared["key"] is not None else None
         if key is not None:
@@ -1294,16 +1352,25 @@ class VoiceService:
                     series.covered_count = series.voice_count
                     self.memory.sessions[key].summarized_through = message.message_id
             await self.memory.checkpoint()
-        return [item for item, valid in zip(messages, prepared["valid"], strict=True) if valid]
+        return [
+            item
+            for item, valid, ignored in zip(
+                messages,
+                prepared["valid"],
+                prepared.get("ignored", [False] * len(messages)),
+                strict=True,
+            )
+            if valid or ignored
+        ]
 
     @staticmethod
     def _joined(transcripts: list[str | None], failures: list[str]) -> str:
         if len(transcripts) == 1:
             return transcripts[0] if transcripts[0] is not None else failures[0]
         return "\n\n".join(
-            f"Голосовое {i + 1}/{len(transcripts)}:\n"
-            + (part if part is not None else f"[{failures[i]}]")
+            f"Голосовое {i + 1}/{len(transcripts)}:\n{part}"
             for i, part in enumerate(transcripts)
+            if part is not None
         )
 
     async def _send_result(

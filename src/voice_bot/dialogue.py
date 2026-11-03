@@ -69,7 +69,7 @@ class DialogueContext:
             series.covered_count = max(series.covered_count or 0, series.summarized_count)
         count = series.voice_count + int(message_id > series.counted_through)
         if count - series.summarized_count < every and not (
-            force and series.voice_count > (series.covered_count or 0)
+            force and series.voice_count > series.summarized_count
         ):
             return None
         previous = [
@@ -81,17 +81,24 @@ class DialogueContext:
         entries = previous + [
             Entry((message_id,), sent_at, transcript, "voice", duration_seconds, reply_contexts)
         ]
+        new_count = count - series.summarized_count
+        voices = [
+            e
+            for e in entries
+            if e.kind == "voice"
+            and e.summary is None
+            and max(e.message_ids) > session.summarized_through
+            and e.sent_at >= series.started_at
+        ][-new_count:]
+        # Text before this block belongs to another conversation unless explicitly
+        # referenced. In particular, it must not become a new unaddressed branch.
+        start = min((e.sent_at, max(e.message_ids)) for e in voices)
         sources = [
             e
             for e in entries
-            if e.summary is None
-            and max(e.message_ids) > session.summarized_through
-            and (e.kind == "text" or e.sent_at >= series.started_at)
+            if e in voices or (e.kind == "text" and (e.sent_at, max(e.message_ids)) >= start)
         ]
-        voices = [e for e in sources if e.kind == "voice"]
-        new_count = count - (series.covered_count or 0)
         partial = len(voices) < new_count or any(e.text.endswith("…") for e in sources)
-        background = tuple(e.summary or e.text for e in previous if e not in sources)
         references = bounded_contexts(
             tuple(context for entry in sources for context in entry.reply_contexts),
             min(6000, self.settings.context_max_chars // 2),
@@ -103,9 +110,9 @@ class DialogueContext:
                 + f":\n{e.text}"
                 for i, e in enumerate(sources, 1)
             ),
-            background=background,
+            background=(),
             reply_contexts=references,
-            voice_count=count,
+            voice_count=new_count,
             duration_seconds=sum(e.duration_seconds for e in voices),
             shared=shared_dialogue(
                 self.memory,
@@ -115,7 +122,6 @@ class DialogueContext:
                 sent_at,
                 message_id,
                 partial=partial,
-                has_previous_summary=bool(series.covered_count),
             ),
             partial=partial,
         )

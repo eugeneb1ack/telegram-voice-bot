@@ -512,7 +512,7 @@ async def test_stt_failure_cleans_up_and_does_not_log_body(settings, caplog):
     assert not paths[0].exists()
     assert service.active_jobs == 0
     assert "SECRET" not in caplog.text
-    assert "SECRET" not in message.answer.await_args.args[0]
+    message.answer.assert_not_awaited()
 
 
 async def test_timeout_after_stt_preserves_transcript(settings):
@@ -811,7 +811,7 @@ def identified_message(index, *, duration=30, author=222, seconds=0, forwarded=F
     return message
 
 
-async def test_short_voice_context_is_reused_without_extra_summary_request(settings):
+async def test_short_voice_does_not_add_unlinked_context_to_standalone_summary(settings):
     service, bot, _ = make_dependencies(settings)
     first = identified_message(1, duration=7)
     await service.handle(first, bot)
@@ -819,11 +819,11 @@ async def test_short_voice_context_is_reused_without_extra_summary_request(setti
     second = identified_message(2, seconds=30)
     await service.handle(second, bot)
     context = service.summarizer.summarize.await_args.kwargs["context"]
-    assert context.recent_summaries == ("Полный <текст> & да.",)
+    assert context.recent_summaries == ()
     await service.handle(second, bot)
     assert service.summarizer.summarize.await_count == 1
     context = service.summarizer.summarize.await_args.kwargs["context"]
-    assert context.recent_summaries == ("Полный <текст> & да.",)
+    assert context.recent_summaries == ()
     await service.close()
 
 
@@ -860,7 +860,7 @@ def test_memory_uses_original_identity_and_does_not_guess_hidden_authors():
     assert conversation_position(message) is None
 
 
-async def test_concurrent_author_messages_receive_preceding_summary_in_order(settings):
+async def test_concurrent_author_messages_stay_ordered_without_automatic_context(settings):
     service, bot, _ = make_dependencies(settings)
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -880,7 +880,7 @@ async def test_concurrent_author_messages_receive_preceding_summary_in_order(set
     await asyncio.gather(first, second)
     calls = service.summarizer.summarize.await_args_list
     assert calls[0].kwargs["context"].recent_summaries == ()
-    assert calls[1].kwargs["context"].recent_summaries == ("Речь",)
+    assert calls[1].kwargs["context"].recent_summaries == ()
     await service.close()
 
 
@@ -925,7 +925,7 @@ async def test_mixed_forwarded_authors_are_explicit_and_do_not_share_memory(sett
     assert not service.memory.sessions
 
 
-async def test_partial_batch_preserves_successes_and_marks_failed_record(settings, caplog):
+async def test_partial_batch_preserves_successes_without_failure_messages(settings, caplog):
     service, bot, paths = make_dependencies(settings)
     bot.send_rich_message = AsyncMock()
     service.transcriber.transcribe.side_effect = ["Первая", RuntimeError("SECRET"), "Третья"]
@@ -934,8 +934,8 @@ async def test_partial_batch_preserves_successes_and_marks_failed_record(setting
     rich = bot.send_rich_message.await_args.kwargs["rich_message"]
     transcript = rich.blocks[-1].blocks[0].blocks[0].text
     assert "Первая" in transcript and "Третья" in transcript
-    assert "Голосовое 2/3:\n[Не удалось распознать запись.]" in transcript
-    assert rich.blocks[2].text.startswith("Часть записей не обработана.")
+    assert "Голосовое 2/3" not in transcript
+    assert "не обработана" not in rich.model_dump_json()
     assert "SECRET" not in rich.model_dump_json() + caplog.text
     assert all(not path.exists() for path in paths)
     assert not service.memory.sessions
@@ -955,7 +955,7 @@ async def test_batch_timeout_delivers_completed_transcripts_and_cleans_all_files
     await service._handle_messages([identified_message(i, forwarded=True) for i in (1, 2)], bot)
     rich = bot.send_rich_message.await_args.kwargs["rich_message"]
     assert "Готовая часть" in rich.blocks[-1].blocks[0].blocks[0].text
-    assert "превышено время" in rich.blocks[-1].blocks[0].blocks[0].text
+    assert "превышено время" not in rich.blocks[-1].blocks[0].blocks[0].text
     assert all(not path.exists() for path in paths)
     assert service.active_jobs == 0
 
@@ -1085,12 +1085,12 @@ async def test_failed_attempt_cannot_be_retriggered_by_command_spam(settings):
     for _ in range(100):
         await service.enqueue(message, bot)
     assert service.transcriber.transcribe.await_count == 1
-    assert message.answer.await_count == 1
+    assert message.answer.await_count == 0
     assert not service.processed.completed
     now[0] = 61
     await service.handle(message, bot)
     assert service.transcriber.transcribe.await_count == 2
-    assert message.answer.await_count == 2
+    assert message.answer.await_count == 1
     assert len(service.processed.records) == 1
 
 
