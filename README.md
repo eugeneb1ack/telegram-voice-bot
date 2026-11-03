@@ -89,7 +89,7 @@ STT models keep their existing request format.
 
 Hints can reduce spelling errors but cannot guarantee error-free recognition or the
 absence of invented words. Only words actually spoken should appear; evaluate both
-relevant names and unrelated/conflicting audio. Summary displays the author's name
+relevant names and unrelated/conflicting audio. The application adds the summary author label itself: the name comes
 first, with `@username` only when no name is available. Forwarded messages retain their
 original author.
 

@@ -229,11 +229,11 @@ class HTTPSummarizer:
             "не критический разбор: спорные тезисы передавай как мнение автора без своих оценок. "
             "Ругань, оскорбления, извинения и обращения без самостоятельного смысла "
             "опускай полностью, включая комментарии о том, что они прозвучали. "
-            "В первом предложении естественно используй имя из context.author_name; "
-            "только если имя отсутствует или пустое — @никнейм из context.author_username; "
-            "если нет и никнейма — «Автор». Тот же приоритет действует для авторов "
-            "в voices и reply_contexts: при наличии имени никнейм не добавляй. "
-            "Отдельную строку об авторе не добавляй. "
+            "Подпись основного автора добавит приложение: не добавляй его имя, никнейм "
+            "или вводное «автор» в начало итога. Пиши содержание как короткую заметку. "
+            "Когда нужно назвать собеседника из reply_contexts или различить нескольких "
+            "авторов voices, предпочитай author_name; только при отсутствии имени "
+            "используй @author_username. Не придумывай имя. "
             "Для пересылок используй исходного автора; авторы отдельных записей указаны "
             "в voices. При author_source=multiple различай участников, не приписывай всё одному. "
             "is_forwarded описывает доставку записи: из этого признака не следует, "
@@ -317,4 +317,10 @@ class HTTPSummarizer:
             raise ProviderError("Не удалось получить полное summary.") from None
         if not isinstance(text, str) or not text.strip():
             raise ProviderError("Сервис вернул пустое summary.")
-        return text.strip()
+        text = text.strip()
+        if context is not None and context.author_source != "multiple":
+            name = " ".join((context.author_name or "").split())
+            username = (context.author_username or "").strip()
+            label = name or (f"@{username}" if username else "Автор")
+            return f"{label}: {text}"
+        return text
