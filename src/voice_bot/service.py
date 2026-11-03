@@ -3,9 +3,10 @@ import hashlib
 import json
 import logging
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -26,12 +27,14 @@ from voice_bot.admin import GroupAdmin
 from voice_bot.audio import BoundedFile, convert_audio
 from voice_bot.batching import VoiceBatcher, batch_key
 from voice_bot.config import Settings
-from voice_bot.conversation import ConversationKey, ConversationMemory
+from voice_bot.conversation import Anchor, ConversationKey, ConversationMemory, Session
 from voice_bot.deduplication import ProcessedVoices, RecentResults, voice_keys
 from voice_bot.delivery import ephemeral, recipient, reply_to
+from voice_bot.dialogue import DialogueSummaries
 from voice_bot.errors import ProviderError, UserFacingError
 from voice_bot.jobs import VoiceJobQueue
 from voice_bot.limits import NoticeLimiter, SenderKey, sender_key
+from voice_bot.progress import typing
 from voice_bot.providers import Summarizer, SummaryContext, Transcriber, VoicePartContext
 from voice_bot.quotas import PrivateVoiceQuota
 from voice_bot.rendering import render_batch, render_replies
@@ -80,6 +83,9 @@ def summary_context(message: Message) -> SummaryContext:
 
 
 def conversation_position(message: Message) -> tuple[ConversationKey, float] | None:
+    # Private /text results must never feed the public conversation.
+    if recipient(message):
+        return None
     origin = getattr(message, "forward_origin", None)
     user: User | None
     sent_at: datetime | None
@@ -96,7 +102,7 @@ def conversation_position(message: Message) -> tuple[ConversationKey, float] | N
     if author_id is None:
         return None
     key = (message.chat.id, getattr(message, "message_thread_id", None) or 0, author_id)
-    return key, sent_at.timestamp()
+    return key + ((1,) if origin is not None else ()), sent_at.timestamp()
 
 
 class VoiceService:
@@ -128,8 +134,25 @@ class VoiceService:
         self._owners: dict[str, SenderKey] = {}
         self._pending_by_sender: Counter[SenderKey] = Counter()
         self._requesters: dict[str, Message] = {}
+        self._context_owners: dict[str, tuple[ConversationKey, int]] = {}
+        self._capacity = asyncio.Semaphore(settings.max_concurrent_jobs)
         self.memory = ConversationMemory(
-            settings.context_ttl_seconds, settings.context_max_chars, settings.context_max_sessions
+            settings.context_ttl_seconds,
+            settings.context_max_chars,
+            settings.context_max_sessions,
+            max_entries=settings.context_max_messages,
+            path=settings.context_state_file,
+        )
+        self.dialogue = DialogueSummaries(
+            self.memory,
+            settings,
+            summarizer,
+            self._capacity,
+            lambda key, target: any(
+                owner == key and message_id <= target
+                for owner, message_id in self._context_owners.values()
+            ),
+            self._context_allowed,
         )
         self.batcher = VoiceBatcher(
             self._enqueue_batch,
@@ -144,6 +167,33 @@ class VoiceService:
             settings.max_pending_jobs_per_chat,
         )
         self._jobs: set[asyncio.Task[object]] = set()
+
+    def _context_allowed(self, key: ConversationKey, session: Session) -> bool:
+        if self.settings.allowed_chat_ids and key[0] not in self.settings.allowed_chat_ids:
+            return False
+        if self.admin is not None and key[0] < 0:
+            return self.admin.store.allowed(key[0]) and self.admin.store.automatic(key[0])
+        return True
+
+    def start(self, bot: Bot) -> None:
+        self.dialogue.start(bot)
+
+    async def observe_text(self, message: Message) -> None:
+        text = getattr(message, "text", None)
+        if (
+            self.batcher.closed
+            or not text
+            or text.lstrip().startswith("/")
+            or getattr(message, "forward_origin", None) is not None
+            or not self.work_allowed(message)
+        ):
+            return
+        position = conversation_position(message)
+        if position is None:
+            return
+        key, sent_at = position
+        self.memory.remember(key, sent_at, (message.message_id,), text, kind="text")
+        await self.memory.checkpoint()
 
     def chat_allowed(self, message: Message) -> bool:
         if self.admin is not None:
@@ -197,6 +247,7 @@ class VoiceService:
 
     def _release(self, message: Message, *, failed: bool = False) -> None:
         key = voice_keys(message)[0]
+        self._context_owners.pop(key, None)
         actor = self._owners.pop(key, None)
         if actor is not None:
             self._pending_by_sender[actor] -= 1
@@ -252,6 +303,10 @@ class VoiceService:
             accepted = bool(self.processed.reply_ids(message)) or await self._charge_private(
                 message
             )
+            position = conversation_position(message)
+            if accepted and position is not None:
+                context_key = position[0]
+                self._context_owners[voice_keys(message)[0]] = (context_key, message.message_id)
             return accepted
         except OSError:
             logger.error("private_quota_storage_unavailable")
@@ -333,6 +388,7 @@ class VoiceService:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.settings.job_timeout_seconds
         self.batcher.finish()
+        await self.dialogue.close()
         tasks = set(self.batcher.tasks)
         if tasks:
             try:
@@ -352,6 +408,7 @@ class VoiceService:
                     if not direct_task.done():
                         direct_task.cancel()
                 await asyncio.gather(*direct_tasks, return_exceptions=True)
+        await self.memory.checkpoint()
         self.memory.clear()
         self.processed.pending.clear()
         self._owners.clear()
@@ -360,6 +417,7 @@ class VoiceService:
         self._quota_charged.clear()
         self._sent_ids.clear()
         self.results.clear()
+        self._context_owners.clear()
 
     async def _handle_messages(self, messages: list[Message], bot: Bot) -> None:
         claimed = [message for message in messages if await self._claim(message)]
@@ -368,6 +426,20 @@ class VoiceService:
 
     async def _handle_reserved_messages(self, messages: list[Message], bot: Bot) -> None:
         message = messages[-1]
+        async with (
+            self._capacity,
+            typing(
+                bot,
+                message.chat.id,
+                getattr(message, "message_thread_id", None),
+                enabled=lambda: not recipient(message) and self.work_allowed(message),
+            ),
+        ):
+            await self._run_reserved_messages(messages, bot)
+
+    async def _run_reserved_messages(self, messages: list[Message], bot: Bot) -> None:
+        message = messages[-1]
+        started = time.monotonic()
         admitted = False
         completed: list[Message] = []
         task = asyncio.current_task()
@@ -441,6 +513,11 @@ class VoiceService:
                 self.active_jobs -= 1
             if task is not None:
                 self._jobs.discard(task)
+            logger.info(
+                "voice_job_finished message_id=%s elapsed_ms=%s",
+                message.message_id,
+                round((time.monotonic() - started) * 1000),
+            )
 
     async def _transcribe(self, message: Message, bot: Bot) -> str:
         settings, voice = self.settings, message.voice
@@ -501,15 +578,31 @@ class VoiceService:
         needs_summary = (
             is_batch or message.voice.duration >= self.settings.summary_min_voice_seconds
         )
+        ids = tuple(item.message_id for item in messages)
+        session = self.memory.sessions.get(key) if key is not None else None
+        if (
+            not is_batch
+            and key is not None
+            and len(key) == 3
+            and self.settings.context_summary_every
+            and self.memory.available
+            and session is not None
+            and times
+            and any(
+                entry.kind == "voice"
+                and 0 <= min(times) - entry.sent_at <= self.settings.context_series_gap_seconds
+                and max(entry.message_ids) < min(ids)
+                for entry in session.entries
+            )
+        ):
+            needs_summary = False
         summary = (
             "Не удалось составить краткое содержание. Полная расшифровка ниже."
             if needs_summary
             else None
         )
-        summaries_succeeded = False
         transcripts: list[str | None] = [None] * len(messages)
         failures = ["Не обработано: превышено время ожидания."] * len(messages)
-        ids = tuple(item.message_id for item in messages)
         try:
             async with asyncio.timeout_at(deadline):
                 for index, item in enumerate(messages):
@@ -566,6 +659,10 @@ class VoiceService:
                             + ":".join(voice_keys(item, scoped=False)[0] for item in messages)
                             + ":"
                             + hashlib.sha256(transcript.encode()).hexdigest()
+                            + ":"
+                            + hashlib.sha256(
+                                json.dumps(asdict(context), sort_keys=True).encode()
+                            ).hexdigest()
                         )
                         cached_summary = self.results.get(cache_key)
                         if cached_summary is None:
@@ -574,7 +671,6 @@ class VoiceService:
                             )
                             self.results.put(cache_key, cached_summary)
                         summary = cached_summary
-                        summaries_succeeded = True
                         logger.info("summary_completed message_id=%s", message.message_id)
                     except Exception as exc:
                         logger.warning("summary_unavailable error_type=%s", type(exc).__name__)
@@ -594,14 +690,24 @@ class VoiceService:
             return []
         self._sent_ids[voice_keys(message)[0]] = sent_ids
         logger.info("voice_job_delivered message_id=%s", message.message_id)
-        # Store a short successful summary; short notes reuse STT without another API call.
+        # Keep source evidence, never a chain of summaries of summaries.
         if all(part is not None for part in transcripts) and self.chat_allowed(message):
             self.memory.remember(
                 key,
                 max(times) if times else 0,
                 ids,
-                summary if summaries_succeeded and summary else transcript,
+                transcript,
+                duration_seconds=sum(item.voice.duration for item in messages if item.voice),
+                anchor=Anchor(
+                    message.message_id,
+                    summary_context(message).author_name,
+                    summary_context(message).author_username,
+                    getattr(message.chat, "type", None),
+                )
+                if not is_batch
+                else None,
             )
+            await self.memory.checkpoint()
         return [item for item, text in zip(messages, transcripts, strict=True) if text is not None]
 
     @staticmethod

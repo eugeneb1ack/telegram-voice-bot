@@ -98,6 +98,7 @@ async def run(settings: Settings) -> None:
             dispatcher.include_router(build_modes_router(admin))
             dispatcher.include_router(build_router(service))
             await admin.notify_pending(bot)
+            service.start(bot)
             logger.info(
                 "polling_started bot_id=%s username=%s",
                 me.id,

@@ -8,6 +8,7 @@ services:
       GROUP_STATE_FILE: /app/data/groups.json
       PROCESSED_STATE_FILE: /app/data/processed.jsonl
       PRIVATE_USAGE_FILE: /app/data/private-usage.json
+      CONTEXT_STATE_FILE: /app/data/conversations.json
     volumes:
       - group-state:/app/data
     read_only: true

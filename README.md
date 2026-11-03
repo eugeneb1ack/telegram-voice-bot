@@ -8,6 +8,33 @@ Telegram bot for voice messages.
 - Summarizes recordings.
 - Combines multiple forwarded voice messages into one transcript and summary.
 
+## Conversation context
+
+Each voice gets its complete transcript immediately, with a typing indicator during
+processing. A cumulative summary replies to every third voice from the same author:
+voices 3, 6, 9, and so on. Nearby text from that author contributes context but does
+not increment the voice counter. Summaries use source messages, never summaries of
+summaries. A standalone recording of at least 30 seconds keeps its usual summary;
+continuations are summarized on every third voice. Forwarded batches remain separate.
+
+A gap over 180 seconds between the author's messages starts a new series. Defaults:
+15-minute TTL, 12 messages and 12,000 characters per context, at most 200 contexts.
+Older context is evicted when a limit is reached; Telegram transcripts stay complete.
+Keys contain chat, forum topic and author IDs. Display names are not identifiers.
+Forwarded voices use a separate scope. Private `/text` does not read or populate
+public context; quiet mode does not collect text. Only received updates are used,
+not historical Telegram messages.
+
+Context and delivery markers survive restarts via an atomic snapshot with mode 0600.
+One bot process must own one data directory; do not share it between instances.
+Unprocessed voice jobs still queue in RAM. A storage failure disables cumulative
+summaries while ordinary transcription continues. Ambiguous Telegram deliveries
+are not automatically repeated; the next group of three includes available context.
+
+See `CONTEXT_*` in [.env.example](.env.example). `CONTEXT_SUMMARY_EVERY=0` disables
+cumulative summaries; `CONTEXT_TTL_SECONDS=0` disables context collection entirely.
+When upgrading, change an explicitly configured `CONTEXT_MAX_CHARS=800` to `12000`.
+
 ## Group modes
 
 | Mode | Behavior |
@@ -76,12 +103,14 @@ specified in `OWNER_ID`, send `/admin` to the bot in a private chat and approve 
 
 ## Data
 
-Temporary audio files are deleted after processing. Transcripts are not saved to disk
-or included in application logs. Pending jobs and recent context stay in RAM;
-context and temporary delivery results are automatically cleared. The Docker volume
-`group-state` stores group permissions and modes, usage counters, identifier hashes and
-public Telegram reply IDs.
-Operational logs contain no voice message content.
-Audio, text and context are sent to OpenAI for processing; replies remain in Telegram.
+Temporary audio files are deleted after processing. Bounded excerpts of source
+transcripts and ordinary text are stored in `conversations.json` in the `group-state`
+Docker volume to survive restarts. Expired records are removed while the bot runs,
+or on the next startup if it was stopped. This is not a chat archive. Other volume
+files store group permissions and modes, usage counters, identifier hashes and public
+Telegram reply IDs. Pending jobs and temporary delivery results remain in RAM.
+Operational logs contain stage timings without audio, message text, API bodies,
+credentials or Telegram exception contents. Audio, text and context are sent to
+OpenAI for processing; replies remain in Telegram.
 
 License: [MIT](LICENSE).

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "voice-bot"
-version = "0.2.0"
+version = "0.3.0"
 description = "Telegram voice summaries and complete collapsible transcripts"
 readme = "README.md"
 license = "MIT"
