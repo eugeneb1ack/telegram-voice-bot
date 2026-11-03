@@ -195,15 +195,15 @@ async def test_short_voices_defer_uncached_reply_media_until_summary_across_rest
         for mid in (13, 14, 15):
             await process_voice(restarted, bot, mid)
         assert restarted.transcriber.transcribe.await_count == 5
-        assert (
-            restarted.summarizer.summarize.await_args.kwargs["context"].reply_contexts[0].text
-            == FOREIGN_TEXT
-        )
+        assert restarted.memory.reply_source(-100, 1).text == FOREIGN_TEXT
+        assert restarted.summarizer.summarize.await_args.kwargs[
+            "context"
+        ].dialogue.has_previous_summary
     finally:
         await restarted.close()
 
 
-async def test_sixth_voice_keeps_earlier_explicit_sources_in_the_cumulative_summary(settings):
+async def test_sixth_voice_uses_previous_recap_without_repeating_old_branches(settings):
     service, bot, _ = setup(settings)
     try:
         for number in range(10, 16):
@@ -211,9 +211,9 @@ async def test_sixth_voice_keeps_earlier_explicit_sources_in_the_cumulative_summ
         calls = service.summarizer.summarize.await_args_list
         assert len(calls) == 2
         assert calls[0].kwargs["context"].reply_contexts
-        assert (
-            calls[1].kwargs["context"].reply_contexts == calls[0].kwargs["context"].reply_contexts
-        )
+        assert calls[1].kwargs["context"].reply_contexts == ()
+        assert calls[1].kwargs["context"].dialogue.has_previous_summary
+        assert service.memory.reply_source(-100, 1).text == FOREIGN_TEXT
         assert FOREIGN_TEXT not in calls[1].args[0]
         assert all(FOREIGN_TEXT not in text for text in calls[1].kwargs["context"].recent_summaries)
         assert all(f"Собственная мысль {number}." in calls[1].args[0] for number in (13, 14, 15))

@@ -87,7 +87,12 @@ async def run(settings: Settings) -> None:
             proxy=settings.openai_proxy_url.get_secret_value() or None,
             timeout=settings.request_timeout_seconds,
             follow_redirects=False,
-            limits=httpx.Limits(max_connections=settings.max_concurrent_jobs * 2),
+            limits=httpx.Limits(
+                max_connections=settings.max_concurrent_jobs * 2,
+                # Voice series often pause longer than HTTPX's five-second default.
+                # Reuse the proxy/TLS connection instead of reconnecting for each voice.
+                keepalive_expiry=60,
+            ),
             trust_env=False,
         ) as client:
             api = APIClient(client, settings)

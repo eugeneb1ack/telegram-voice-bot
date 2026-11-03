@@ -338,8 +338,8 @@ class HTTPSummarizer:
             instructions += (
                 " В этом режиме вместо transcript дан dialogue: общая история одного чата "
                 "с author_id и reply_to_message_id. focus_author_id — автор этого итога. "
-                "Его накопленные реплики распределены приложением по branches.message_ids. "
-                "kind=summary — уже опубликованный пересказ отдельной длинной записи: "
+                "Его НОВЫЕ реплики распределены приложением по branches.message_ids. "
+                "kind=summary — уже опубликованный пересказ предыдущих записей: "
                 "это только фон для новых реплик, не пересказывай его отдельным тезисом заново. "
                 "Верни JSON с одним строковым полем для каждого branch_id. В каждом поле "
                 "пересказывай только собственные реплики этой ветки; общая история и слова "
@@ -350,7 +350,17 @@ class HTTPSummarizer:
                 "последнему собеседнику. Вопрос про один предмет не отвечает на вопрос "
                 "про другой только из-за близости сообщений. Внутри ветки могут быть "
                 "разные темы: сохрани их раздельно. Исправление относится только к своей "
-                "теме и адресату. Это накопительный итог, включая ранние реплики этой серии. "
+                "теме и адресату. Это итог НОВОЙ части разговора. Главный объём ответа отдай "
+                "новым фактам, вопросам, аргументам и изменениям из branches.message_ids. "
+                "Не пересказывай прежний итог заново. Если нужна связка, добавь не более "
+                "одного короткого вводного уточнения по теме, например «По поводу переноски: …». "
+                "Не сжимай новые существенные детали ради повторения старых. "
+                "Если has_previous_summary=true, поле recap — связка с предыдущим итогом: "
+                "одно короткое предложение, максимум 25 слов, только опорная тема или "
+                "актуальное ранее принятое решение. Не начинай историю заново, не перечисляй "
+                "старые детали и не добавляй сюда новые факты из branches. Если темы сменились "
+                "или старый итог недоступен, recap оставь пустым. Остальные поля — полноценный "
+                "пересказ новых реплик: не ужимай их до общих названий тем. "
                 "Если раннее предложение уточнено позже, даже в другом пункте этого итога, "
                 "пометь старый вариант как первоначальный: он не должен выглядеть действующим "
                 "одновременно с новым. Связь уточнения должна следовать из явной цепочки reply. "
@@ -367,7 +377,11 @@ class HTTPSummarizer:
             for field in ("dialogue", "recent_summaries", "reply_contexts", "reply_to_text"):
                 metadata.pop(field, None)
             data = {"context": metadata, "dialogue": asdict(dialogue)}
-            fields = {branch.branch_id: {"type": "string"} for branch in dialogue.branches}
+            fields: dict[str, dict[str, Any]] = {
+                branch.branch_id: {"type": "string"} for branch in dialogue.branches
+            }
+            if dialogue.has_previous_summary:
+                fields = {"recap": {"type": "string", "maxLength": 240}, **fields}
             output_format = {
                 "text": {
                     "format": {
@@ -415,6 +429,8 @@ class HTTPSummarizer:
             try:
                 sections = json.loads(text)
                 expected = {branch.branch_id for branch in dialogue.branches}
+                if dialogue.has_previous_summary:
+                    expected.add("recap")
                 if not isinstance(sections, dict) or set(sections) != expected:
                     raise ValueError
                 if any(not isinstance(value, str) for value in sections.values()):
@@ -422,6 +438,12 @@ class HTTPSummarizer:
             except (ValueError, TypeError):
                 raise ProviderError("Не удалось получить сводку по веткам диалога.") from None
             parts: list[str] = []
+            if recap := sections.get("recap", "").strip():
+                for prefix in ("ранее:", "ранее "):
+                    if recap.lower().startswith(prefix):
+                        recap = recap[len(prefix) :].lstrip()
+                        break
+                parts.append(f"Ранее: {recap}")
             for branch in dialogue.branches:
                 body = sections[branch.branch_id].strip()
                 if not body:
