@@ -68,9 +68,11 @@ async def test_only_semantically_selected_source_reaches_summary(settings):
                 }
             )
         graph = json.loads(payload["input"])["dialogue"]
-        assert {m["message_id"] for m in graph["messages"]} == {1, 10, 11, 12}
+        branch = graph["branches"][0]
+        assert {m["message_id"] for m in branch["primary_messages"]} == {10, 11, 12}
+        assert [m["message_id"] for m in branch["background_messages"]] == [1]
         assert "candidates" not in graph
-        assert graph["branches"][0]["context_message_ids"] == [1]
+        assert branch["background_messages"][0]["role"] == "same_speaker"
         return response({"b1": "У выбранного велосипеда удобное седло; купит его завтра."})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
@@ -171,7 +173,8 @@ async def test_invalid_selector_response_does_not_block_summary(settings, body):
             return httpx.Response(200, json=body)
         graph = json.loads(payload["input"])["dialogue"]
         assert "candidates" not in graph
-        assert [m["message_id"] for m in graph["messages"]] == [10, 11, 12]
+        assert [m["message_id"] for m in graph["branches"][0]["primary_messages"]] == [10, 11, 12]
+        assert not graph["branches"][0]["background_messages"]
         return response({"b1": "Пересказ только новых записей."})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:

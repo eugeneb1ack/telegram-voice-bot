@@ -12,6 +12,7 @@ import httpx
 
 from voice_bot.config import Settings
 from voice_bot.dialogue_graph import SharedDialogue
+from voice_bot.dialogue_summary import DIALOGUE_INSTRUCTIONS, dialogue_payload
 from voice_bot.errors import NoSpeechError, ProviderError
 from voice_bot.reply_context import ReplyContext
 from voice_bot.semantic_context import select_continuations
@@ -340,55 +341,18 @@ class HTTPSummarizer:
             assert context is not None
             if sum(len(m.text) for m in dialogue.messages) > settings.summary_max_input_chars:
                 raise ProviderError("Диалог слишком длинный для настроенного лимита summary.")
-            instructions += (
-                " В этом режиме вместо transcript дан dialogue: выбранный фрагмент одного чата "
-                "с author_id и reply_to_message_id. focus_author_id — автор этого итога. "
-                "Его НОВЫЕ реплики распределены приложением по branches.message_ids. "
-                "Для каждой ветки используй только её message_ids как материал пересказа, "
-                "а context_message_ids — только для пояснения отсылок этой ветки. "
-                "Смысловой контекст не доказывает адресата. "
-                "Обрезанные источники с … не достраивай. "
-                "Сообщения остальных веток не добавляй в неё и не дублируй под «Дополнительно». "
-                "kind=summary — уже опубликованный пересказ предыдущих записей: "
-                "это только фон для новых реплик, не пересказывай его отдельным тезисом заново. "
-                "Верни JSON с одним строковым полем для каждого branch_id. В каждом поле "
-                "пересказывай только собственные реплики этой ветки; общая история и слова "
-                "других участников поясняют, кому и на что он отвечает. Не превращай слова "
-                "собеседников в позицию автора. В том же разговоре у другого автора будет "
-                "свой итог с другим фокусом. Не переноси ответы между ветками, не объединяй "
-                "людей по одинаковому имени. Не приписывай реплики без явного адресата "
-                "последнему собеседнику. Вопрос про один предмет не отвечает на вопрос "
-                "про другой только из-за близости сообщений. Внутри ветки могут быть "
-                "разные темы: сохрани их раздельно. Исправление относится только к своей "
-                "теме и адресату. Это итог НОВОЙ части разговора. Главный объём ответа отдай "
-                "новым фактам, вопросам, аргументам и изменениям из branches.message_ids. "
-                "Не пересказывай прежний итог заново. Если нужна связка, добавь не более "
-                "одного короткого вводного уточнения по теме, например «По поводу переноски: …». "
-                "Не сжимай новые существенные детали ради повторения старых. "
-                "Если has_previous_summary=true, поле recap — связка с предыдущим итогом: "
-                "одно короткое предложение, максимум 25 слов, только опорная тема или "
-                "актуальное ранее принятое решение. Не начинай историю заново, не перечисляй "
-                "старые детали и не добавляй сюда новые факты из branches. Если темы сменились "
-                "или старый итог недоступен, recap оставь пустым. Остальные поля — полноценный "
-                "пересказ новых реплик: не ужимай их до общих названий тем. "
-                "Если раннее предложение уточнено позже, даже в другом пункте этого итога, "
-                "пометь старый вариант как первоначальный: он не должен выглядеть действующим "
-                "одновременно с новым. Связь уточнения должна следовать из явной цепочки reply. "
-                "Восстанови смысл вопроса из связанного текста или речи кружка; изображения "
-                "кружка здесь нет. Не угадывай то, чего в речи нет. Обращение к боту или "
-                "обсуждение его работы без reply не приписывай предыдущему участнику. "
-                "Каждое значение — краткий обычный текст без имени основного автора, "
-                "заголовков адресата, HTML и Markdown: подписи добавит приложение. "
-                "Если в ветке только технический счёт или пустые звуки, верни пустую строку. "
-                "Не пропускай содержательные вопросы. partial=true означает, что часть "
-                "ранних источников удалена по лимитам: не восстанавливай их догадками."
+            instructions = (
+                DIALOGUE_INSTRUCTIONS
+                + f"Язык ответа: {settings.summary_language}. "
+                + summary_length_hint(transcript, context, settings)
             )
-            metadata = asdict(context)
-            for field in ("dialogue", "recent_summaries", "reply_contexts", "reply_to_text"):
-                metadata.pop(field, None)
-            selected_dialogue = asdict(dialogue)
-            selected_dialogue.pop("candidates", None)
-            data = {"context": metadata, "dialogue": selected_dialogue}
+            data = {
+                "context": {
+                    "is_conversation": context.is_conversation,
+                    "duration_seconds": context.duration_seconds,
+                },
+                "dialogue": dialogue_payload(dialogue, settings.summary_max_input_chars),
+            }
             fields: dict[str, dict[str, Any]] = {
                 branch.branch_id: {"type": "string"} for branch in dialogue.branches
             }
@@ -449,6 +413,9 @@ class HTTPSummarizer:
                     raise ValueError
             except (ValueError, TypeError):
                 raise ProviderError("Не удалось получить сводку по веткам диалога.") from None
+            author_name = " ".join((context.author_name or "").split()) if context else ""
+            author_username = (context.author_username or "").strip() if context else ""
+            author_label = author_name or (f"@{author_username}" if author_username else "Автор")
             parts: list[str] = []
             if recap := sections.get("recap", "").strip():
                 for prefix in ("ранее:", "ранее "):
@@ -464,12 +431,14 @@ class HTTPSummarizer:
                     name = " ".join((branch.recipient_name or "").split())
                     username = (branch.recipient_username or "").strip()
                     label = name or (f"@{username}" if username else "собеседник")
-                    parts.append(f"• Ответ → {label}: {body}")
+                    parts.append(f"• {author_label} → {label}:\n{body}")
                 elif len(dialogue.branches) > 1:
-                    parts.append(f"• Дополнительно: {body}")
+                    parts.append(f"• {author_label}:\n{body}")
                 else:
                     parts.append(body)
             text = "\n\n".join(parts) or "В записях нет содержательных реплик для сводки."
+            if len(dialogue.branches) > 1 or any(b.is_reply for b in dialogue.branches):
+                return text
         if context is not None and context.author_source != "multiple":
             name = " ".join((context.author_name or "").split())
             username = (context.author_username or "").strip()

@@ -58,11 +58,17 @@ chronology and verbatim evidence quotes are validated. Ambiguous links are dropp
 The summary request sees at most three selected sources; rejected candidates never
 reach it. Explicit replies take priority, and inferred continuity never invents a recipient.
 
-Each branch carries the exact IDs of its primary messages and eligible context.
-Other speakers' text, captions and existing transcripts clarify that answer without
-becoming the author's statements. Different recipients get separate sections;
-unaddressed messages remain separate. Telegram IDs identify people; display names
-are preferred over usernames. Semantic selection uses the configured summary model
+Before generation, the application resolves each branch into separate current-speech
+and background lists. It validates primary speakers by Telegram ID; recipient names
+are presentation labels, never speaking-role instructions. Background retains its
+own author and may clarify references without becoming new claims. The model no
+longer joins a flat message graph. Answers use the focus author's first person, with
+explicit “Author → Recipient” labels; unaddressed speech carries only the author's
+name. Different recipients remain separate. Display names take priority over usernames.
+The summary must preserve negation, uncertainty and limits: listening to music does
+not imply playing it, and one melody played with one finger does not imply general
+proficiency. This adds no model call and does not alter original transcripts.
+Semantic selection uses the configured summary model
 only before a summary with available candidates. The first two short voices do not
 wait for it. It has a four-second timeout; failure falls back to current messages and
 explicit replies. Cached audio is never re-transcribed for context. Semantic selection

@@ -361,8 +361,8 @@ async def test_structured_summary_exact_branches_and_deterministic_names(
             result = await summarizer.summarize("Текст", context=context)
             assert (
                 result
-                == "Имя автора:\n\n" + ("Ранее: Обсуждали поездку с котом.\n\n" if previous else "")
-                + "• Ответ → Анна: Вопрос про кота."
-                "\n\n• Ответ → @user3: Про девушку.\n\n• Дополнительно: Про бота."
+                == ("Ранее: Обсуждали поездку с котом.\n\n" if previous else "")
+                + "• Имя автора → Анна:\nВопрос про кота."
+                "\n\n• Имя автора → @user3:\nПро девушку.\n\n• Имя автора:\nПро бота."
             )
     assert len(calls) == 1
