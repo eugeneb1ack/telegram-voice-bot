@@ -69,6 +69,12 @@ source snapshot, not a recursive reply history. Summary prompts distinguish the 
 question/proposal, the author's response/clarification and the actual outcome, without
 adding decisions, unnecessary sections or filler.
 
+Summary instructions distinguish events, intentions and attitudes: a reply alone does
+not confirm a proposal, and reluctance does not establish whether an action happened.
+Known references retain concrete details, while unrelated background is not repeated
+as new content. The author's current texts may cover separate topics; microphone checks
+and content-free counting are omitted from the summary, with full transcripts preserved.
+
 ## Spelling hints during transcription
 
 `gpt-transcribe` receives up to 16 literal vocabulary hints (320 characters total)
