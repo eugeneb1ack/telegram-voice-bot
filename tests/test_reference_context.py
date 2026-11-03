@@ -131,8 +131,29 @@ def test_only_leading_person_can_inherit_an_old_name(text, expected):
 def test_unknown_opening_person_is_never_marked_as_the_speaker():
     _, graph = story()
     primary = dialogue_payload(graph, 10000)["branches"][0]["primary_messages"]
-    assert primary[0]["unresolved_person"] == "Он"
-    assert not primary[1]["unresolved_person"]
+    assert primary[0]["unresolved_reference"] == "Он"
+    assert not primary[1]["unresolved_reference"]
+
+
+@pytest.mark.parametrize("direct_reply", [True, False])
+def test_known_object_reference_is_not_marked_as_an_unknown_person(direct_reply):
+    _, graph = story()
+    source = replace(graph.candidates[0], text="Купил новый велосипед.")
+    first = replace(
+        graph.messages[0],
+        text="Он лёгкий и удобный.",
+        reply_to_message_id=source.message_id if direct_reply else None,
+    )
+    graph = replace(
+        graph,
+        messages=(source, first, *graph.messages[1:]),
+        branches=tuple(
+            replace(b, context_message_ids=(source.message_id,)) for b in graph.branches
+        ),
+    )
+    branch = dialogue_payload(graph, 10000)["branches"][0]
+    assert branch["primary_messages"][0]["unresolved_reference"] is None
+    assert branch["background_messages"][0]["text"] == "Купил новый велосипед."
 
 
 def test_person_in_a_later_new_topic_cannot_inherit_the_old_name():

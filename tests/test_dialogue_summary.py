@@ -51,7 +51,7 @@ async def test_own_speech_and_other_speaker_background_are_separate_on_wire(sett
         assert not b2["background_messages"]
         assert [m["message_id"] for m in b2["primary_messages"]] == [12]
         assert "профессиональный" not in payload["input"]
-        assert "Антон" not in payload["input"]
+        assert json.loads(payload["input"])["context"]["speaker_name"] == "Антон"
         assert all("author_name" not in m for m in b1["primary_messages"])
         return response(
             {
@@ -107,3 +107,32 @@ def test_unknown_background_author_never_becomes_same_speaker():
     assert dialogue_payload(graph, 10000)["branches"][0]["background_messages"][0]["role"] == (
         "other_speaker"
     )
+
+
+@pytest.mark.parametrize(
+    "name,username,label",
+    [
+        ("  Анна\nПетрова  ", "handle", "Анна Петрова"),
+        (None, "handle", "@handle"),
+        ("<example/>", "handle", "<example/>"),
+    ],
+)
+async def test_speaker_display_name_reaches_model_without_duplicate_heading(
+    settings, name, username, label
+):
+    graph = music_dialogue()
+    graph = replace(graph, branches=(graph.branches[1],), messages=(graph.messages[-1],))
+    body = f"{label} надеется получить понятный пересказ."
+
+    def respond(request):
+        payload = json.loads(request.content)
+        assert json.loads(payload["input"])["context"]["speaker_name"] == label
+        assert label not in payload["instructions"]
+        return response({"b2": body})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        result = await HTTPSummarizer(APIClient(client, settings)).summarize(
+            "Надеюсь получить понятный пересказ.",
+            context=SummaryContext(author_name=name, author_username=username, dialogue=graph),
+        )
+    assert result == body

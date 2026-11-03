@@ -348,6 +348,8 @@ class HTTPSummarizer:
             )
             data = {
                 "context": {
+                    "speaker_name": " ".join((context.author_name or "").split())
+                    or (f"@{context.author_username.strip()}" if context.author_username else None),
                     "is_conversation": context.is_conversation,
                     "duration_seconds": context.duration_seconds,
                 },
@@ -443,5 +445,7 @@ class HTTPSummarizer:
             name = " ".join((context.author_name or "").split())
             username = (context.author_username or "").strip()
             label = name or (f"@{username}" if username else "Автор")
+            if dialogue is not None and text.startswith(f"{label} "):
+                return text
             return f"{label}:" + ("\n\n" if dialogue and len(dialogue.branches) > 1 else " ") + text
         return text

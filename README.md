@@ -74,7 +74,8 @@ own author and may clarify references without becoming new claims. The model no
 longer joins a flat message graph. Answers use third-person narration, with
 explicit “Author → Recipient” labels; unaddressed speech carries only the author's
 name. Unknown people are explicitly left unspecified. Different recipients remain
-separate. Display names take priority over usernames.
+separate. The narration uses the display name instead of a generic “author”, with
+a username fallback when no name is available.
 The summary must preserve negation, uncertainty and limits: listening to music does
 not imply playing it, and one melody played with one finger does not imply general
 proficiency. This adds no model call and does not alter original transcripts.
