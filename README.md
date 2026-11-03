@@ -21,7 +21,8 @@ continuations are summarized on every third voice. Forwarded batches remain sepa
 A gap over 180 seconds between the author's messages starts a new series. Defaults:
 15-minute TTL, 12 messages and 12,000 characters per context, at most 200 contexts.
 Older context is evicted when a limit is reached; Telegram transcripts stay complete.
-Keys contain chat, forum topic and author IDs. Display names are not identifiers.
+Keys contain chat, actual forum topic and author IDs. Ordinary replies stay in the
+same author's series; a reply-chain ID is not a forum topic. Display names are not identifiers.
 Forwarded voices use a separate scope. Private `/text` does not read or populate
 public context; quiet mode does not collect text. Only received updates are used,
 not historical Telegram messages.
@@ -37,6 +38,36 @@ entire transcript.
 See `CONTEXT_*` in [.env.example](.env.example). `CONTEXT_SUMMARY_EVERY=0` disables
 cumulative summaries; `CONTEXT_TTL_SECONDS=0` disables context collection entirely.
 When upgrading, change an explicitly configured `CONTEXT_MAX_CHARS=800` to `12000`.
+
+## Explicit reply context
+
+When a voice replies to another message, summaries use that exact source as background:
+text, captions (including bot messages), voice, or speech from a round video note.
+Ordinary videos and other attachments contribute only their textual captions; the
+attachment itself is never downloaded or transcribed for context. The source is attributed separately from
+the author's own words. A reply on the first or second voice remains available for the
+third voice's summary, including after restart. It does not increment the author's
+voice counter and is not appended to the transcript. The next triple does not inherit
+another person's source unless one of its messages explicitly replies to it again.
+
+Only the referenced message in the same chat is eligible. Other chats and ephemeral
+sources are excluded; no surrounding history of the other participant is fetched.
+An explicit reference across forum topics may provide background, while each topic's
+voice counter remains separate. Ordinary reply chains are not forum topics.
+
+Existing source transcripts are reused. If speech from the referenced voice/video note has
+not been recognized yet, it uses the same bounded download, FFmpeg and STT path inside
+the current job. Additional context work has a 45-second ceiling and reserves time
+for the summary. Video notes contribute speech only, not visual interpretation. Unavailable
+or oversized sources do not prevent delivery of the author's transcript; the summary
+must not invent missing context. No models have changed.
+
+Referenced text is bounded to 3,000 characters per voice and 6,000 per summary, also
+subject to the existing conversation character budget. The bounded source and explicit
+reply relation are persisted with the conversation; pending jobs store one shallow
+source snapshot, not a recursive reply history. Summary prompts distinguish the source
+question/proposal, the author's response/clarification and the actual outcome, without
+adding decisions, unnecessary sections or filler.
 
 ## Durable queue
 

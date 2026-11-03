@@ -5,6 +5,16 @@ from datetime import UTC, datetime
 from aiogram.types import EphemeralMessageParameters, Message, ReplyParameters
 
 
+def forum_topic_id(message: Message) -> int | None:
+    # Ordinary reply chains also have message_thread_id. Only actual forum topics
+    # create a separate conversation/batch scope and accept topic routing.
+    return (
+        getattr(message, "message_thread_id", None)
+        if getattr(message, "is_topic_message", False)
+        else None
+    )
+
+
 def personal(message: Message) -> Message | None:
     if message.chat.type not in {"group", "supergroup"}:
         return message

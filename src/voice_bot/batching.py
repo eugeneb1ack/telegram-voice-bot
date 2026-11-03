@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from aiogram import Bot
 from aiogram.types import Message
 
+from voice_bot.delivery import forum_topic_id
+
 logger = logging.getLogger(__name__)
 BatchKey = tuple[int, int, str, int]
 BatchHandler = Callable[[list[Message], Bot], Awaitable[None]]
@@ -25,7 +27,7 @@ def batch_key(message: Message) -> BatchKey | None:
         sender, sender_id = "user", user.id
     else:
         return None
-    return (message.chat.id, getattr(message, "message_thread_id", None) or 0, sender, sender_id)
+    return (message.chat.id, forum_topic_id(message) or 0, sender, sender_id)
 
 
 @dataclass

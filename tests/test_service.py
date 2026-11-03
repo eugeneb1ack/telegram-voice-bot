@@ -326,15 +326,25 @@ async def test_summary_gets_author_chat_and_bounded_reply_context(settings):
     message = make_message()
     message.from_user = SimpleNamespace(id=111, full_name="Анна", username="anna")
     message.chat.type, message.chat.title = "supergroup", "Рабочая группа"
-    message.reply_to_message = SimpleNamespace(text="План встречи " * 200, caption=None)
+    message.reply_to_message = SimpleNamespace(
+        message_id=40,
+        chat=message.chat,
+        text="План встречи " * 400,
+        caption=None,
+        from_user=User(id=444, is_bot=False, first_name="Собеседник"),
+    )
     await service.handle(message, bot)
     context = service.summarizer.summarize.await_args.kwargs["context"]
     assert context.author_name == "Анна" and context.author_username == "anna"
     assert context.author_source == "sender" and not context.is_forwarded
     assert context.chat_type == "supergroup" and context.chat_title == "Рабочая группа"
     assert context.duration_seconds == 30
-    assert len(context.reply_to_text) == 1000
-    assert context.reply_to_text == message.reply_to_message.text[:1000]
+    assert context.reply_to_text is None
+    assert len(context.reply_contexts) == 1
+    reply = context.reply_contexts[0]
+    assert reply.reply_to_message_id == 40
+    assert len(reply.text) == 3000
+    assert reply.text == message.reply_to_message.text[:2999] + "…"
 
 
 def test_missing_identity_and_username_only_fallback():
@@ -828,6 +838,7 @@ async def test_context_does_not_cross_identity_scope_or_time(settings, separatio
         next_message.chat.id = 999
     elif separation == "topic":
         next_message.message_thread_id = 55
+        next_message.is_topic_message = True
     elif separation == "day":
         next_message.date += timedelta(days=1)
     else:

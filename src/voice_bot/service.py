@@ -31,7 +31,7 @@ from voice_bot.batching import VoiceBatcher, batch_key
 from voice_bot.config import Settings
 from voice_bot.conversation import Anchor, ConversationKey, ConversationMemory, Session
 from voice_bot.deduplication import ProcessedVoices, RecentResults, voice_keys
-from voice_bot.delivery import ephemeral, recipient, reply_to
+from voice_bot.delivery import ephemeral, forum_topic_id, recipient, reply_to
 from voice_bot.dialogue import DialogueContext, DialogueInput
 from voice_bot.errors import ProviderError, UserFacingError
 from voice_bot.jobs import VoiceJobQueue
@@ -41,6 +41,13 @@ from voice_bot.progress import typing
 from voice_bot.providers import Summarizer, SummaryContext, Transcriber, VoicePartContext
 from voice_bot.quotas import PrivateVoiceQuota
 from voice_bot.rendering import render_batch, render_replies
+from voice_bot.reply_context import (
+    ReplyContext,
+    as_voice,
+    bounded_contexts,
+    media_kind,
+    reply_target,
+)
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -105,7 +112,7 @@ def conversation_position(message: Message) -> tuple[ConversationKey, float] | N
     author_id = getattr(user, "id", None)
     if author_id is None:
         return None
-    key = (message.chat.id, getattr(message, "message_thread_id", None) or 0, author_id)
+    key = (message.chat.id, forum_topic_id(message) or 0, author_id)
     return key + ((1,) if origin is not None else ()), sent_at.timestamp()
 
 
@@ -545,7 +552,7 @@ class VoiceService:
             typing(
                 bot,
                 message.chat.id,
-                getattr(message, "message_thread_id", None),
+                forum_topic_id(message),
                 enabled=lambda: not recipient(message) and self.work_allowed(message),
             ),
         ):
@@ -715,6 +722,82 @@ class VoiceService:
             logger.info("transcription_completed message_id=%s", message.message_id)
             return transcript
 
+    async def _reply_context(
+        self, message: Message, bot: Bot, *, deadline: float | None = None
+    ) -> ReplyContext | None:
+        target = reply_target(message)
+        if target is None:
+            return None
+        kind = media_kind(target)
+        if kind is None:
+            return None
+        cache_key = "reply-context:" + voice_keys(message)[0]
+        cached = self._result_get(cache_key)
+        if cached is not None:
+            saved = ReplyContext(**json.loads(cached))
+            if saved.kind == kind and saved.reply_to_message_id == target.message_id:
+                return saved
+        previous = self.memory.reply_source(message.chat.id, target.message_id)
+        if kind != "text" and previous is not None and previous.kind == kind:
+            author = summary_context(target)
+            context = replace(
+                previous,
+                message_id=message.message_id,
+                author_name=author.author_name,
+                author_username=author.author_username,
+            )
+            self._result_put(cache_key, json.dumps(asdict(context), ensure_ascii=False))
+            return context
+        caption = getattr(target, "text", None) or getattr(target, "caption", None) or ""
+        source = caption if kind == "text" else ""
+        unavailable = None
+        if kind != "text":
+            # Exact message lookup: no unrelated history of the other author is read.
+            source = self.memory.source(message.chat.id, target.message_id) or ""
+            media = as_voice(target)
+            if not source and media is not None:
+                try:
+                    if recipient(message):
+                        media = media.model_copy(update={"receiver_user": message.receiver_user})
+                    remaining = 45.0
+                    if deadline is not None:
+                        remaining = max(
+                            0.0, min(remaining, deadline - asyncio.get_running_loop().time() - 15)
+                        )
+                    async with asyncio.timeout(remaining):
+                        source = await self._transcribe(media, bot)
+                except (ProviderError, UserFacingError, TimeoutError, TelegramAPIError):
+                    unavailable = "Не удалось получить речь из исходного сообщения."
+                    logger.info(
+                        "reply_context_unavailable message_id=%s target_id=%s",
+                        message.message_id,
+                        target.message_id,
+                    )
+                except Exception as exc:
+                    logger.warning("reply_context_failed error_type=%s", type(exc).__name__)
+                    unavailable = "Контекст исходного сообщения недоступен."
+            if caption:
+                source = f"Подпись: {caption}\nРечь: {source}" if source else f"Подпись: {caption}"
+        if not source and not unavailable:
+            return None
+        author = summary_context(target)
+        context = bounded_contexts(
+            (
+                ReplyContext(
+                    message_id=message.message_id,
+                    reply_to_message_id=target.message_id,
+                    author_name=author.author_name,
+                    author_username=author.author_username,
+                    kind=kind,
+                    text=source,
+                    unavailable_reason=unavailable,
+                ),
+            ),
+            min(3000, self.settings.context_max_chars // 4),
+        )[0]
+        self._result_put(cache_key, json.dumps(asdict(context), ensure_ascii=False))
+        return context
+
     async def _process(
         self,
         messages: list[Message],
@@ -758,6 +841,7 @@ class VoiceService:
             else None
         )
         dialogue: DialogueInput | None = None
+        reply_contexts: tuple[ReplyContext, ...] = ()
         transcripts: list[str | None] = [None] * len(messages)
         failures = ["Не обработано: превышено время ожидания."] * len(messages)
         try:
@@ -783,6 +867,15 @@ class VoiceService:
                         failures[index] = "Не удалось распознать запись."
                 if not self.work_allowed(message):
                     return []
+                references: list[ReplyContext] = []
+                for item, recognized in zip(messages, transcripts, strict=True):
+                    if recognized is not None:
+                        reference = await self._reply_context(item, bot, deadline=deadline)
+                        if reference is not None:
+                            references.append(reference)
+                reply_contexts = bounded_contexts(
+                    tuple(references), min(6000, self.settings.context_max_chars // 2)
+                )
                 transcript = self._joined(transcripts, failures)
                 summary_input = transcript
                 if not is_batch and transcripts[0] is not None:
@@ -792,6 +885,7 @@ class VoiceService:
                         message.message_id,
                         transcript,
                         message.voice.duration,
+                        reply_contexts=reply_contexts,
                     )
                     if dialogue is not None:
                         needs_summary = True
@@ -804,6 +898,8 @@ class VoiceService:
                     context = replace(
                         context,
                         recent_summaries=self.memory.recent(key, min(times) if times else 0, ids),
+                        reply_to_text=None,
+                        reply_contexts=reply_contexts,
                     )
                     if dialogue is not None:
                         context = replace(
@@ -811,8 +907,17 @@ class VoiceService:
                             recent_summaries=dialogue.background,
                             duration_seconds=dialogue.duration_seconds,
                             is_conversation=True,
+                            reply_contexts=dialogue.reply_contexts,
                         )
                     if is_batch:
+                        if reply_contexts:
+                            summary_input = "\n\n".join(
+                                f"Сообщение {item.message_id}:\n"
+                                f"{part if part is not None else failures[index]}"
+                                for index, (item, part) in enumerate(
+                                    zip(messages, transcripts, strict=True)
+                                )
+                            )
                         authors = [summary_context(item) for item in messages]
                         same_author = all(
                             (item.author_name, item.author_username)
@@ -873,6 +978,7 @@ class VoiceService:
             "key": key,
             "times": times,
             "dialogue": dialogue is not None,
+            "reply_contexts": [asdict(context) for context in reply_contexts],
         }
         if self.journal is not None and job_id is not None:
             self.journal.set(job_id, "result", prepared)
@@ -897,6 +1003,10 @@ class VoiceService:
         self._sent_ids[voice_keys(message)[0]] = sent_ids
         logger.info("voice_job_delivered message_id=%s", message.message_id)
         key = tuple(prepared["key"]) if prepared["key"] is not None else None
+        if key is not None:
+            # Old prepared jobs may have mistaken an ordinary reply thread for a topic.
+            # Normalize only routing; keep author/forward scope and frozen output intact.
+            key = (key[0], forum_topic_id(message) or 0, *key[2:])
         times = prepared["times"]
         if all(prepared["valid"]) and self.chat_allowed(message):
             self.memory.remember(
@@ -904,6 +1014,9 @@ class VoiceService:
                 max(times) if times else 0,
                 tuple(item.message_id for item in messages),
                 prepared["transcript"],
+                reply_contexts=tuple(
+                    ReplyContext(**context) for context in prepared.get("reply_contexts", [])
+                ),
                 duration_seconds=sum(item.voice.duration for item in messages if item.voice),
                 anchor=Anchor(
                     message.message_id,
@@ -964,7 +1077,7 @@ class VoiceService:
                         async def transmit_rich() -> Message:
                             return await bot.send_rich_message(
                                 chat_id=message.chat.id,
-                                message_thread_id=getattr(message, "message_thread_id", None),
+                                message_thread_id=forum_topic_id(message),
                                 rich_message=render_batch(summary, transcript, count),
                                 ephemeral_message_parameters=ephemeral(message),
                                 reply_parameters=ReplyParameters(
@@ -1050,7 +1163,7 @@ class VoiceService:
                                 chat_id=message.chat.id,
                                 from_chat_id=message.chat.id,
                                 message_id=source_id,
-                                message_thread_id=getattr(message, "message_thread_id", None),
+                                message_thread_id=forum_topic_id(message),
                                 reply_parameters=ReplyParameters(
                                     message_id=message.message_id, allow_sending_without_reply=False
                                 ),
