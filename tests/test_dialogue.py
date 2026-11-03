@@ -39,7 +39,7 @@ async def text(service, number, words, *, author=222, seconds=None):
     await service.observe_text(message)
 
 
-async def test_third_and_sixth_voice_are_single_combined_replies_for_each_new_triple(settings):
+async def test_third_and_sixth_voice_are_single_cumulative_replies(settings):
     from test_rendering import ParsedReply
 
     service, bot, _ = setup(settings)
@@ -48,14 +48,14 @@ async def test_third_and_sixth_voice_are_single_combined_replies_for_each_new_tr
         message.answer.assert_awaited_once()
         reply = message.answer.await_args.args[0]
         assert ParsedReply(reply).transcript == f"  Мысль {number}.\n"
-        assert ("Коротко · 3 голосовых:" in reply) == (number % 3 == 0)
+        assert (f"Коротко · {number} голосовых:" in reply) == (number % 3 == 0)
         assert service.summarizer.summarize.await_count == number // 3
         assert message.answer.await_args.kwargs["reply_parameters"].message_id == number
     calls = service.summarizer.summarize.await_args_list
     assert all(f"Мысль {i}." in calls[0].args[0] for i in (1, 2, 3))
     assert all(f"Мысль {i}." in calls[1].args[0] for i in (4, 5, 6))
-    assert all(f"Мысль {i}." not in calls[1].args[0] for i in (1, 2, 3))
-    assert len(calls[1].kwargs["context"].recent_summaries) == 3
+    assert all(f"Мысль {i}." in calls[1].args[0] for i in (1, 2, 3))
+    assert calls[1].kwargs["context"].recent_summaries == ()
     assert all(c.kwargs["context"].is_conversation for c in calls)
     bot.send_message.assert_not_awaited()
     await service.close()
@@ -111,9 +111,9 @@ async def test_restart_between_second_and_third_restores_context_and_does_not_re
     await third.close()
 
 
-async def test_three_minute_gap_resets_counter_but_new_series_still_summarizes(settings):
+async def test_two_hour_gap_resets_counter_but_new_series_still_summarizes(settings):
     service, bot, _ = setup(settings)
-    for number, seconds in [(1, 0), (2, 20), (3, 250), (4, 270), (5, 290)]:
+    for number, seconds in [(1, 0), (2, 20), (3, 7200), (4, 7220), (5, 7240)]:
         await voice(service, bot, number, seconds=seconds)
         await service.dialogue.maintain()
         assert service.summarizer.summarize.await_count == int(number == 5)
@@ -171,7 +171,7 @@ async def test_later_voice_and_text_cannot_change_third_combined_reply(settings)
     await service.close()
 
 
-async def test_summary_failure_keeps_one_reply_and_next_triple_starts_cleanly(settings):
+async def test_summary_failure_keeps_transcripts_for_the_next_cumulative_summary(settings):
     service, bot, _ = setup(settings)
     service.summarizer.summarize.side_effect = TimeoutError("SECRET")
     for i in range(1, 4):
@@ -184,7 +184,7 @@ async def test_summary_failure_keeps_one_reply_and_next_triple_starts_cleanly(se
         message = await voice(service, bot, i)
     assert service.summarizer.summarize.await_count == 2
     source = service.summarizer.summarize.await_args.args[0]
-    assert "Мысль 1." not in source and "Мысль 6." in source
+    assert "Мысль 1." in source and "Мысль 6." in source
     bot.send_message.assert_not_awaited()
     await service.close()
 
@@ -438,8 +438,8 @@ async def test_legacy_separate_summary_watermark_does_not_repeat_an_old_triple(s
     for number in (4, 5, 6):
         message = await voice(service, bot, number)
         message.answer.assert_awaited_once()
-        assert ("Коротко · 3 голосовых:" in message.answer.await_args.args[0]) == (number == 6)
+        assert ("Коротко · 6 голосовых:" in message.answer.await_args.args[0]) == (number == 6)
     call = service.summarizer.summarize.await_args
-    assert "Старое" not in call.args[0]
-    assert len(call.kwargs["context"].recent_summaries) == 3
+    assert "Старое" in call.args[0]
+    assert call.kwargs["context"].recent_summaries == ()
     await service.close()

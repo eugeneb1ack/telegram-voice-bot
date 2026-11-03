@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     context_max_messages: int = Field(default=12, ge=2, le=50)
     context_state_file: Path = Path("data/conversations.json")
     context_summary_every: int = Field(default=3, ge=0, le=10)
-    context_series_gap_seconds: int = Field(default=180, ge=10, le=900)
+    context_series_gap_seconds: int = Field(default=900, ge=10, le=900)
     voice_batch_pause_seconds: float = Field(default=3, ge=0, le=5)
     voice_batch_max_messages: int = Field(default=10, ge=2, le=10)
     max_voice_seconds: int = Field(default=600, ge=1, le=600)
