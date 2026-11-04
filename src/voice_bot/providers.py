@@ -355,6 +355,14 @@ class HTTPSummarizer:
                 },
                 "dialogue": dialogue_payload(dialogue, settings.summary_max_input_chars),
             }
+            primary = data["dialogue"]["primary_messages"]
+            logger.info(
+                "summary_dialogue_prepared message_id=%s primary=%s replies=%s linked=%s",
+                max((m["message_id"] for m in primary), default=0),
+                len(primary),
+                sum(m["reply_to"] is not None for m in primary),
+                sum(len(m["background"]) for m in primary),
+            )
             output_format = {
                 "text": {
                     "format": {

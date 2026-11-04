@@ -68,9 +68,12 @@ Multiple possible people, a topic switch or an unproven
 name must not be resolved by guessing. An explicit reply already selected in the
 current block can also clarify its continuation, regardless of the source's age.
 
-Before generation, the application separates current speech from background and checks
-primary authors by Telegram ID. Reply recipients remain data, not speaking-role instructions.
-The model returns one coherent narrative across the branches, without recipient headings
+Before generation, the application checks primary authors by Telegram ID and orders
+speech chronologically. Every utterance has its own exact `reply_to` text, speaker and
+available reply chain. Semantic background is also attached to one utterance only;
+a shared recipient cannot pool unrelated replies. The speaker, recipient and a third
+person mentioned in the text remain distinct roles.
+The model returns one coherent narrative across the current messages, without recipient headings
 or bullet lists; two short paragraphs are allowed for genuinely separate topics.
 It names recipients inside the prose when needed and does not invent links between topics.
 Display names are preserved literally, with a username fallback. Background only clarifies
@@ -295,3 +298,18 @@ credentials or Telegram exception contents. Audio, text and context are sent to
 OpenAI for processing; replies remain in Telegram.
 
 License: [MIT](LICENSE).
+
+## Readable logs
+
+`Rich` is a development-only dependency. The local viewer consumes existing log lines
+from stdin without changing the bot or exposing message bodies:
+
+```bash
+uv sync --locked
+docker logs --tail 100 --follow voicebot-voice-bot-1 2>&1 | uv run python scripts/watch_logs.py
+```
+
+Pipe the same command through SSH for a remote server. The viewer shows stages,
+message IDs, timings and reply/context counts. Use `--timezone UTC` to override
+Europe/Moscow, and `--title` for a custom heading. Counts include the initial tail;
+EOF is displayed explicitly. Restart the command after recreating the container.
