@@ -120,9 +120,12 @@ async def test_recovered_next_triplet_has_an_independent_window(settings, tmp_pa
 
     def message(mid, seconds):
         item = voice(mid)
-        item.date = base + timedelta(seconds=seconds)
-        item.voice.duration = 10
-        return item.as_(bot)
+        return item.model_copy(
+            update={
+                "date": base + timedelta(seconds=seconds),
+                "voice": item.voice.model_copy(update={"duration": 10}),
+            }
+        ).as_(bot)
 
     for mid, seconds in [(1, 0), (2, 20), (3, 40)]:
         await service.accept(message(mid, seconds), bot)

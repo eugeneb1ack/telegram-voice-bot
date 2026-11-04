@@ -260,10 +260,12 @@ class ConversationMemory:
         completed = self.series_at(key, sent_at)
         if completed is not None:
             session.claimed_through = max(session.claimed_through, completed.counted_through)
-        # Queued jobs can have provisionally opened future windows. Rebuild those
-        # in processing order, from the first recognized voice of the next block.
+        # Earlier windows cannot become current again. Discard provisional windows
+        # from older versions; queued jobs open their blocks in processing order.
         session.series = [
-            series for series in session.series if series is not completed and series.voice_count
+            series
+            for series in session.series
+            if series.started_at > sent_at and series.voice_count
         ]
 
     def touch(self, key: ConversationKey | None) -> Session | None:

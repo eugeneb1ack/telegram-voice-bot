@@ -539,6 +539,26 @@ async def test_later_admission_cannot_split_earlier_queued_voices(settings):
     await service.close()
 
 
+async def test_closing_a_block_cannot_reactivate_an_older_overlapping_window(settings):
+    from voice_bot.conversation import Series
+
+    service, bot, _ = setup(settings)
+    for mid in (1, 2):
+        await voice(service, bot, mid, seconds=mid * 10)
+    # State produced by the former admission-time window assignment.
+    timestamp = identified_message(3, seconds=30).date.timestamp()
+    service.memory.sessions[(123, 0, 222)].series.append(Series(timestamp, timestamp))
+    await voice(service, bot, 3, seconds=30)
+    await voice(service, bot, 4, seconds=40, duration=20)
+    assert service.summarizer.summarize.await_count == 1
+    for mid in (5, 6, 7):
+        await voice(service, bot, mid, seconds=mid * 10)
+        assert service.summarizer.summarize.await_count == 1 + int(mid == 7)
+    context = service.summarizer.summarize.await_args.kwargs["context"]
+    assert context.dialogue.branches[0].message_ids == (5, 6, 7)
+    await service.close()
+
+
 async def test_completed_block_and_next_block_can_share_telegram_timestamp(settings):
     service, bot, _ = setup(settings)
     for mid in range(1, 7):
