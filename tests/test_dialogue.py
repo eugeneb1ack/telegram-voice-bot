@@ -525,6 +525,20 @@ async def test_future_admissions_cannot_choose_the_next_block_window(settings):
     await service.close()
 
 
+async def test_later_admission_cannot_split_earlier_queued_voices(settings):
+    service, bot, _ = setup(settings)
+    for mid in (1, 2, 3):
+        await voice(service, bot, mid, seconds=mid * 10)
+    # The sixth update arrives after the first summary, before jobs four/five run.
+    service._observe_voice_activity(identified_message(6, seconds=60, duration=10))
+    for mid in (4, 5, 6):
+        await voice(service, bot, mid, seconds=mid * 10)
+    assert service.summarizer.summarize.await_count == 2
+    context = service.summarizer.summarize.await_args.kwargs["context"]
+    assert context.dialogue.branches[0].message_ids == (4, 5, 6)
+    await service.close()
+
+
 async def test_completed_block_and_next_block_can_share_telegram_timestamp(settings):
     service, bot, _ = setup(settings)
     for mid in range(1, 7):

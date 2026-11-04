@@ -224,7 +224,7 @@ class VoiceService:
             for message, requester, charged in items:
                 position = conversation_position(message)
                 if position is not None:
-                    self.memory.activity(*position)
+                    self.memory.touch(position[0])
                 key = voice_keys(message)[0]
                 self._journal_keys[key] = job_id
                 self.processed.pending.update(voice_keys(message))
@@ -308,9 +308,8 @@ class VoiceService:
     def _observe_voice_activity(self, message: Message) -> None:
         position = conversation_position(message)
         if position is not None:
-            self.memory.activity(*position)
-            # Admission is already durable in the job journal. Its pending messages
-            # restore timing on restart; do not fsync the same event twice here.
+            self.memory.touch(position[0])
+            # Timestamps are durable in the queue; only ordered processing opens a block.
 
     def chat_allowed(self, message: Message) -> bool:
         if self.admin is not None:

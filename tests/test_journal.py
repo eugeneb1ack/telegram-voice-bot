@@ -109,6 +109,40 @@ async def test_pending_and_active_jobs_survive_shutdown(settings, tmp_path):
     await stop(restarted, bot, journal)
 
 
+async def test_recovered_next_triplet_has_an_independent_window(settings, tmp_path):
+    from datetime import timedelta
+
+    settings.context_summary_every = 3
+    path = tmp_path / "queue.db"
+    sent = []
+    service, bot, journal = runtime(settings, path, sent)
+    base = datetime.now(UTC) - timedelta(seconds=650)
+
+    def message(mid, seconds):
+        item = voice(mid)
+        item.date = base + timedelta(seconds=seconds)
+        item.voice.duration = 10
+        return item.as_(bot)
+
+    for mid, seconds in [(1, 0), (2, 20), (3, 40)]:
+        await service.accept(message(mid, seconds), bot)
+    await idle(service)
+    assert service.summarizer.summarize.await_count == 1
+    for mid, seconds in [(4, 540), (5, 570), (6, 650)]:
+        journal.admit(message(mid, seconds), None, collecting=False, charged=False)
+    await stop(service, bot, journal)
+    restarted, bot, journal = runtime(settings, path, sent)
+    await restarted.recover(bot)
+    await idle(restarted)
+    assert [item.reply_parameters.message_id for item in sent] == [1, 2, 3, 4, 5, 6]
+    assert restarted.summarizer.summarize.await_count == 1
+    context = restarted.summarizer.summarize.await_args.kwargs["context"]
+    assert context.dialogue.branches[0].message_ids == (4, 5, 6)
+    assert "Коротко · 3 голосовых:" in sent[-1].text
+    assert journal.recover(bot) == []
+    await stop(restarted, bot, journal)
+
+
 async def test_transcript_checkpoint_avoids_second_stt_after_restart(settings, tmp_path):
     path = tmp_path / "queue.db"
     sent = []

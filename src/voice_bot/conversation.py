@@ -266,8 +266,8 @@ class ConversationMemory:
             series for series in session.series if series is not completed and series.voice_count
         ]
 
-    def activity(self, key: ConversationKey | None, sent_at: float) -> Series | None:
-        """Record event timing at admission, independently of bounded source text and STT."""
+    def touch(self, key: ConversationKey | None) -> Session | None:
+        """Keep pending context alive without assigning queued messages to a block."""
         self.purge()
         if key is None or len(key) != 3 or not self.ttl or not self.available:
             return None
@@ -275,13 +275,17 @@ class ConversationMemory:
         if session is None:
             session = Session(expires_at=self.clock() + self.retention)
             self.sessions[key] = session
-        series = self._activity(session, sent_at)
         session.expires_at = self.clock() + self.retention
         self.sessions.move_to_end(key)
         while len(self.sessions) > self.max_sessions:
             self.sessions.popitem(last=False)
         self._schedule_expiry()
-        return series
+        return session
+
+    def activity(self, key: ConversationKey | None, sent_at: float) -> Series | None:
+        """Open a window in processing order, using the voice's Telegram timestamp."""
+        session = self.touch(key)
+        return self._activity(session, sent_at) if session is not None else None
 
     def series_at(self, key: ConversationKey, sent_at: float) -> Series | None:
         session = self.sessions.get(key)
