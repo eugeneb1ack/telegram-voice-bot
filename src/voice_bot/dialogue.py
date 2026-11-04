@@ -90,14 +90,7 @@ class DialogueContext:
             and max(e.message_ids) > session.summarized_through
             and e.sent_at >= series.started_at
         ][-new_count:]
-        # Text before this block belongs to another conversation unless explicitly
-        # referenced. In particular, it must not become a new unaddressed branch.
-        start = min((e.sent_at, max(e.message_ids)) for e in voices)
-        sources = [
-            e
-            for e in entries
-            if e in voices or (e.kind == "text" and (e.sent_at, max(e.message_ids)) >= start)
-        ]
+        sources = voices
         partial = len(voices) < new_count or any(e.text.endswith("…") for e in sources)
         references = bounded_contexts(
             tuple(context for entry in sources for context in entry.reply_contexts),

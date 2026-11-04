@@ -66,7 +66,7 @@ async def test_ordinary_reply_thread_uses_zero_scope_and_real_topic_stays_separa
     "seconds,number,included",
     [
         (-601, 1, False),
-        (-600, 1, True),
+        (-600, 1, False),
         (0, 19, True),
         (0, 20, False),
         (0, 21, False),
@@ -83,7 +83,7 @@ async def test_only_earlier_messages_within_series_gap_supply_keywords(
     assert service._transcription_keywords(message) == (("Qdrant",) if included else ())
 
 
-async def test_only_last_three_eligible_sources_are_used_and_typed_spelling_has_priority(
+async def test_only_current_voice_spellings_are_used(
     stt_runtime,
 ):
     service, _, _ = stt_runtime
@@ -96,10 +96,10 @@ async def test_only_last_three_eligible_sources_are_used_and_typed_spelling_has_
     ]:
         remember(service, message, text, number=number, seconds=-100 + number * 10, kind=kind)
 
-    assert service._transcription_keywords(message) == ("PostgreSQL", "Qdrant", "FastAPI")
+    assert service._transcription_keywords(message) == ("Qdrant", "FastAPI")
 
 
-async def test_typed_sources_precede_referenced_recognition_when_budget_is_full(stt_runtime):
+async def test_captions_text_and_foreign_recognition_never_supply_keywords(stt_runtime):
     service, _, _ = stt_runtime
     target = foreign_message(kind="voice")
     message = reply_voice(20, target)
@@ -108,15 +108,11 @@ async def test_typed_sources_precede_referenced_recognition_when_budget_is_full(
     service.memory.remember((-100, 0, 444), target.date.timestamp(), (1,), " ".join(recognized))
     remember(service, message, "PostgreSQL", number=2, kind="text")
 
-    assert service._transcription_keywords(message) == (
-        "CaptionTerm",
-        "PostgreSQL",
-        *recognized[:14],
-    )
+    assert service._transcription_keywords(message) == ()
 
 
 @pytest.mark.parametrize("kind", ["text", "document"])
-async def test_explicit_reply_text_or_attachment_caption_from_bot_is_allowed(stt_runtime, kind):
+async def test_explicit_bot_text_or_caption_does_not_supply_keywords(stt_runtime, kind):
     service, bot, _ = stt_runtime
     target = foreign_message(kind=kind).model_copy(
         update={
@@ -125,7 +121,7 @@ async def test_explicit_reply_text_or_attachment_caption_from_bot_is_allowed(stt
         }
     )
 
-    assert service._transcription_keywords(reply_voice(target=target)) == ("Qdrant",)
+    assert service._transcription_keywords(reply_voice(target=target)) == ()
     bot.get_file.assert_not_awaited()
     service.transcriber.transcribe.assert_not_awaited()
 
@@ -149,7 +145,7 @@ async def test_cross_chat_or_private_reply_text_cannot_supply_keywords(stt_runti
 
 
 @pytest.mark.parametrize("source_kind", ["entry", "reply_context"])
-async def test_referenced_voice_uses_exact_saved_text_without_transcribing_source_again(
+async def test_referenced_voice_does_not_supply_keywords_or_trigger_extra_stt(
     stt_runtime, source_kind
 ):
     service, bot, _ = stt_runtime
@@ -170,7 +166,7 @@ async def test_referenced_voice_uses_exact_saved_text_without_transcribing_sourc
     await service._transcribe(message, bot)
 
     service.transcriber.transcribe.assert_awaited_once()
-    assert service.transcriber.transcribe.await_args.kwargs == {"keywords": ("Qdrant",)}
+    assert service.transcriber.transcribe.await_args.kwargs == {}
     bot.get_file.assert_awaited_once_with(message.voice.file_id)
 
 
@@ -184,7 +180,7 @@ async def test_private_text_delivery_does_not_read_ambient_public_context(
     remember(service, message, "Forbidden")
     message.receiver_user = User(id=222, is_bot=False, first_name="Reader")
 
-    assert service._transcription_keywords(message) == (("Qdrant",) if explicit_reply else ())
+    assert service._transcription_keywords(message) == ()
 
 
 def test_keyword_filter_keeps_literal_words_and_deduplicates_case_insensitively():
@@ -318,7 +314,8 @@ async def test_restart_reuses_frozen_keywords_even_if_context_changes(
     restarted, bot, journal = runtime(settings, path, sent)
     try:
         remember(restarted, message, "NewTerm", number=2, seconds=-5)
-        assert "NewTerm" in restarted._transcription_keywords(message)
+        if initial_word:
+            assert "NewTerm" in restarted._transcription_keywords(message)
         await restarted.recover(bot)
         await idle(restarted)
 
@@ -331,9 +328,7 @@ async def test_restart_reuses_frozen_keywords_even_if_context_changes(
         await stop(restarted, bot, journal)
 
 
-async def test_own_caption_survives_admission_restart_before_keywords_are_frozen(
-    settings, tmp_path
-):
+async def test_own_caption_is_not_retained_or_used_after_restart(settings, tmp_path):
     path = tmp_path / "queue.db"
     sent = []
     service, bot, journal = runtime(settings, path, sent)
@@ -348,7 +343,7 @@ async def test_own_caption_survives_admission_restart_before_keywords_are_frozen
         await idle(restarted)
 
         restarted.transcriber.transcribe.assert_awaited_once()
-        assert restarted.transcriber.transcribe.await_args.kwargs == {"keywords": ("Qdrant",)}
+        assert restarted.transcriber.transcribe.await_args.kwargs == {}
         assert len(sent) == 1
     finally:
         await stop(restarted, bot, journal)

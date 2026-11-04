@@ -321,7 +321,7 @@ def test_forwarded_voice_uses_original_author_not_forwarder(kind):
         )
 
 
-async def test_summary_gets_author_chat_and_bounded_reply_context(settings):
+async def test_summary_gets_author_and_reply_recipient_without_reply_text(settings):
     service, bot, _ = make_dependencies(settings)
     message = make_message()
     message.from_user = SimpleNamespace(id=111, full_name="Анна", username="anna")
@@ -343,8 +343,8 @@ async def test_summary_gets_author_chat_and_bounded_reply_context(settings):
     assert len(context.reply_contexts) == 1
     reply = context.reply_contexts[0]
     assert reply.reply_to_message_id == 40
-    assert len(reply.text) == 3000
-    assert reply.text == message.reply_to_message.text[:2999] + "…"
+    assert reply.text == ""
+    assert reply.author_name == "Собеседник"
 
 
 def test_missing_identity_and_username_only_fallback():

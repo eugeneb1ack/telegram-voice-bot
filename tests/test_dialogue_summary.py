@@ -3,231 +3,128 @@ from dataclasses import replace
 
 import httpx
 import pytest
-from test_semantic_context import response
 
 from voice_bot.dialogue_graph import DialogueBranch, DialogueMessage, SharedDialogue
 from voice_bot.dialogue_summary import dialogue_payload
 from voice_bot.errors import ProviderError
-from voice_bot.providers import APIClient, HTTPSummarizer, SummaryContext, summary_length_hint
+from voice_bot.providers import APIClient, HTTPSummarizer, SummaryContext
 
 
 def music_dialogue():
     return SharedDialogue(
         1,
         (
-            DialogueMessage(1, 2, "Борис", None, "text", "Я играю джаз. А ты играешь?"),
-            DialogueMessage(2, 3, "Вера", None, "text", "Я профессиональный музыкант."),
+            DialogueMessage(1, 2, "Борис", None, "text", "UnrelatedOldTopic"),
+            DialogueMessage(2, 3, "Вера", None, "video_note", "UnrelatedVideoSpeech"),
             DialogueMessage(10, 1, "Антон", None, "voice", "Люблю слушать джаз.", 1),
-            DialogueMessage(
-                11, 1, "Антон", None, "voice", "Играть не умею, только одну мелодию пальцем.", 1
-            ),
-            DialogueMessage(12, 1, "Антон", None, "voice", "Сейчас попробую её сыграть."),
+            DialogueMessage(11, 1, "Антон", None, "voice", "Играть не умею.", 2),
+            DialogueMessage(12, 1, "Антон", None, "voice", "Пойду на концерт."),
         ),
-        (
-            DialogueBranch("b1", 2, "Борис", None, (10, 11), True, (1,)),
-            DialogueBranch("b2", None, None, None, (12,)),
-        ),
+        (DialogueBranch("b1", 2, "Борис", None, (10, 11, 12)),),
     )
 
 
-async def test_own_speech_and_other_speaker_background_are_separate_on_wire(settings):
-    graph = music_dialogue()
+def response(value):
+    return httpx.Response(
+        200,
+        json={
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": json.dumps(value)}],
+                }
+            ],
+        },
+    )
+
+
+async def test_only_current_voices_and_recipient_names_reach_one_model_request(settings):
     calls = []
 
     def respond(request):
         payload = json.loads(request.content)
         calls.append(payload)
-        assert "пунктов" not in payload["instructions"]
-        assert "по веткам" not in payload["instructions"]
-        data = json.loads(payload["input"])["dialogue"]
-        assert "branches" not in data
-        primary = data["primary_messages"]
-        assert [m["message_id"] for m in primary] == [10, 11, 12]
-        assert primary[0]["reply_to"]["speaker"] == {"id": 2, "name": "Борис"}
-        assert primary[1]["reply_to"]["text"] == "Я играю джаз. А ты играешь?"
-        assert primary[2]["reply_to"] is None and not primary[2]["background"]
-        assert "профессиональный" not in payload["input"]
-        assert json.loads(payload["input"])["context"]["speaker_name"] == "Антон"
-        return response(
-            {
-                "summary": (
-                    "Антон любит слушать джаз, но играть не умеет, "
-                    "кроме одной мелодии одним пальцем. "
-                    "Собирается попробовать её сыграть."
-                ),
-            }
-        )
+        primary = json.loads(payload["input"])["dialogue"]["primary_messages"]
+        assert [item["message_id"] for item in primary] == [10, 11, 12]
+        assert primary[0]["reply_recipient"] == {"id": 2, "name": "Борис"}
+        assert primary[1]["reply_recipient"] == {"id": 3, "name": "Вера"}
+        assert primary[2]["reply_recipient"] is None
+        assert "Unrelated" not in payload["input"]
+        return response({"summary": "Антон любит джаз, не умеет играть и собирается на концерт."})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        result = await HTTPSummarizer(APIClient(client, settings)).summarize(
-            "Три записи", context=SummaryContext(author_name="Антон", dialogue=graph)
+        summary = await HTTPSummarizer(APIClient(client, settings)).summarize(
+            "Три записи", context=SummaryContext(author_name="Антон", dialogue=music_dialogue())
         )
-    assert result == (
-        "Антон любит слушать джаз, но играть не умеет, кроме одной мелодии одним пальцем. "
-        "Собирается попробовать её сыграть."
-    )
-    assert len(calls) == 1  # no extra verifier/model round trip
+    assert summary.startswith("Антон любит джаз")
+    assert len(calls) == 1
 
 
-@pytest.mark.parametrize("ids", [(1, 10), (99,), (10, 10), (10, 12)])
-def test_foreign_missing_or_duplicate_primary_cannot_reach_model(ids):
-    graph = music_dialogue()
-    graph = replace(
-        graph, branches=(replace(graph.branches[0], message_ids=ids), graph.branches[1])
-    )
+@pytest.mark.parametrize("ids", [(1, 10), (99,), (10, 10)])
+def test_foreign_missing_or_duplicate_primary_is_rejected(ids):
+    graph = replace(music_dialogue(), branches=(DialogueBranch("b", None, None, None, ids),))
     with pytest.raises(ProviderError, match="авторство"):
         dialogue_payload(graph, 10000)
 
 
-def test_repeated_reply_text_counts_towards_request_limit():
+def test_request_limit_counts_current_speech_only():
     graph = music_dialogue()
-    payload = dialogue_payload(graph, 10000)
-    total = sum(
-        len(m["text"]) + (len(m["reply_to"]["text"]) if m["reply_to"] else 0)
-        for m in payload["primary_messages"]
-    )
+    total = sum(len(m.text) for m in graph.messages if m.message_id >= 10)
     dialogue_payload(graph, total)
     with pytest.raises(ProviderError, match="длинный"):
         dialogue_payload(graph, total - 1)
 
 
-def test_unknown_background_author_never_becomes_same_speaker():
-    graph = music_dialogue()
-    graph = replace(
-        graph, messages=(replace(graph.messages[0], author_id=None), *graph.messages[1:])
-    )
-    assert (
-        dialogue_payload(graph, 10000)["primary_messages"][0]["reply_to"]["speaker"]["id"] is None
-    )
+@pytest.mark.parametrize(
+    "value", [None, {}, {"summary": 4}, {"summary": ""}, {"summary": "x", "extra": 1}]
+)
+async def test_invalid_structured_summary_is_rejected(settings, value):
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: response(value))
+    ) as client:
+        with pytest.raises(ProviderError):
+            await HTTPSummarizer(APIClient(client, settings)).summarize(
+                "Три записи", context=SummaryContext(author_name="Антон", dialogue=music_dialogue())
+            )
 
 
 @pytest.mark.parametrize(
     "name,username,label",
     [
-        ("  Анна\nПетрова  ", "handle", "Анна Петрова"),
+        (" Анна\nПетрова ", "handle", "Анна Петрова"),
         (None, "handle", "@handle"),
         ("<example/>", "handle", "<example/>"),
     ],
 )
-async def test_speaker_display_name_reaches_model_without_duplicate_heading(
-    settings, name, username, label
-):
+def test_display_names_are_literal_with_username_fallback(name, username, label):
     graph = music_dialogue()
-    graph = replace(graph, branches=(graph.branches[1],), messages=(graph.messages[-1],))
-    body = f"{label} надеется получить понятный пересказ."
+    graph = replace(
+        graph,
+        messages=tuple(
+            replace(m, author_name=name, author_username=username) if m.message_id >= 10 else m
+            for m in graph.messages
+        ),
+    )
+    assert dialogue_payload(graph, 10000)["primary_messages"][0]["speaker"]["name"] == label
+
+
+async def test_first_long_voice_has_current_author_name_without_saved_history(settings):
+    graph = SharedDialogue(
+        1,
+        (DialogueMessage(10, 1, None, None, "voice", "Пойду на концерт."),),
+        (DialogueBranch("b", None, None, None, (10,)),),
+    )
 
     def respond(request):
-        payload = json.loads(request.content)
-        assert json.loads(payload["input"])["context"]["speaker_name"] == label
-        assert label not in payload["instructions"]
-        return response({"summary": body})
+        data = json.loads(json.loads(request.content)["input"])
+        assert data["dialogue"]["primary_messages"][0]["speaker"]["name"] == "Антон"
+        return response({"summary": "Антон собирается на концерт."})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        result = await HTTPSummarizer(APIClient(client, settings)).summarize(
-            "Надеюсь получить понятный пересказ.",
-            context=SummaryContext(author_name=name, author_username=username, dialogue=graph),
-        )
-    assert result == body
-
-
-def test_interleaved_recipients_are_chronological_and_each_reply_keeps_its_own_source():
-    graph = music_dialogue()
-    messages = list(graph.messages)
-    messages[3] = replace(messages[3], reply_to_message_id=2)
-    messages[4] = replace(messages[4], reply_to_message_id=1)
-    graph = replace(
-        graph,
-        messages=tuple(messages),
-        branches=(
-            DialogueBranch("b1", 2, "Борис", None, (10, 12), True, (1,)),
-            DialogueBranch("b2", 3, "Вера", None, (11,), True, (2,)),
-        ),
-    )
-    primary = dialogue_payload(graph, 10000)["primary_messages"]
-    assert [m["message_id"] for m in primary] == [10, 11, 12]
-    assert [m["reply_to"]["speaker"]["id"] for m in primary] == [2, 3, 2]
-    assert "профессиональный" not in json.dumps(primary[0], ensure_ascii=False)
-    assert "профессиональный" in primary[1]["reply_to"]["text"]
-
-
-def test_reply_to_own_message_keeps_literal_speaker_and_nested_recipient():
-    graph = music_dialogue()
-    graph = replace(
-        graph,
-        messages=tuple(
-            replace(m, reply_to_message_id=10) if m.message_id == 11 else m for m in graph.messages
-        ),
-    )
-    primary = dialogue_payload(graph, 10000)["primary_messages"]
-    reply = primary[1]["reply_to"]
-    assert reply["speaker"] == {"id": 1, "name": "Антон"}
-    assert reply["reply_to"]["speaker"] == {"id": 2, "name": "Борис"}
-    assert primary[2]["reply_to"] is None  # no inherited recipient without evidence
-
-
-def test_branch_background_cannot_leak_into_unlinked_siblings():
-    graph = music_dialogue()
-    graph = replace(
-        graph,
-        branches=(DialogueBranch("b1", None, None, None, (10, 11, 12), False, (1, 2)),),
-        messages=tuple(
-            replace(m, reply_to_message_id=None, context_message_ids=(2,))
-            if m.message_id == 11
-            else m
-            for m in graph.messages
-        ),
-    )
-    primary = dialogue_payload(graph, 10000)["primary_messages"]
-    assert primary[0]["reply_to"]["speaker"]["id"] == 2
-    assert not primary[0]["background"]
-    assert primary[1]["background"][0]["speaker"]["id"] == 3
-    assert not primary[2]["background"] and primary[2]["reply_to"] is None
-
-
-def test_missing_forward_or_cyclic_reply_does_not_invent_a_recipient():
-    graph = music_dialogue()
-    graph = replace(
-        graph,
-        messages=tuple(
-            replace(m, reply_to_message_id=m.message_id + 1) if m.message_id >= 10 else m
-            for m in graph.messages
-        ),
-    )
-    assert all(m["reply_to"] is None for m in dialogue_payload(graph, 10000)["primary_messages"])
-
-
-def test_named_third_person_is_never_promoted_to_message_speaker():
-    graph = music_dialogue()
-    graph = replace(
-        graph,
-        messages=tuple(
-            replace(
-                m,
-                author_name="🐗 💋",
-                kind="video_note",
-                text="Борис попросил меня забрать Веру. Что ей привезти?",
+        assert (
+            await HTTPSummarizer(APIClient(client, settings)).summarize(
+                "Пойду на концерт.", context=SummaryContext(author_name="Антон", dialogue=graph)
             )
-            if m.message_id == 1
-            else m
-            for m in graph.messages
-        ),
-    )
-    primary = dialogue_payload(graph, 10000)["primary_messages"][0]
-    assert primary["speaker"] == {"id": 1, "name": "Антон"}
-    assert primary["reply_to"]["speaker"] == {"id": 2, "name": "🐗 💋"}
-    assert primary["reply_recipient"] == {"id": 2, "name": "🐗 💋"}
-    assert "Борис" in primary["reply_to"]["text"]
-
-
-def test_length_hint_ignores_recipient_grouping_and_unselected_history(settings):
-    graph = music_dialogue()
-    baseline = summary_length_hint("", SummaryContext(dialogue=graph), settings)
-    changed = replace(
-        graph,
-        branches=(DialogueBranch("b1", None, None, None, (10, 11, 12)),),
-        messages=tuple(
-            replace(m, text="Лишняя история " * 1000) if m.message_id == 2 else m
-            for m in graph.messages
-        ),
-    )
-    assert summary_length_hint("", SummaryContext(dialogue=changed), settings) == baseline
+            == "Антон собирается на концерт."
+        )

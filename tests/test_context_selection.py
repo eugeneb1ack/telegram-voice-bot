@@ -27,7 +27,7 @@ async def test_new_block_excludes_old_text_recap_and_other_participants(settings
     await service.close()
 
 
-def test_only_reply_ancestors_are_eligible_not_siblings_or_same_recipient_history():
+def test_only_direct_recipient_identity_is_kept_without_ancestors_or_siblings():
     mem = memory()
     remember(mem, 1, 2)
     remember(mem, 2, 3, refs=(ref(2, 1, 2),))
@@ -38,13 +38,12 @@ def test_only_reply_ancestors_are_eligible_not_siblings_or_same_recipient_histor
     remember(mem, 12)
     sources = mem.sessions[(-100, 0, 1)].entries
     graph = shared_dialogue(mem, (-100, 0, 1), sources, (ref(10, 2, 3),), 12, 12)
-    assert {n.message_id for n in graph.messages} == {1, 2, 10, 11, 12}
+    assert {n.message_id for n in graph.messages} == {2, 10, 11, 12}
     assert graph.branches[0].recipient_id == 3
-    assert graph.branches[0].context_message_ids == (1, 2)
-    assert graph.branches[1].context_message_ids == ()
+    assert next(n.text for n in graph.messages if n.message_id == 2) == ""
 
 
-def test_reply_to_summarized_voice_uses_exact_transcript_not_multitopic_recap():
+def test_reply_to_summarized_voice_excludes_both_transcript_and_recap():
     mem = memory()
     remember(mem, 1)
     session = mem.sessions[(-100, 0, 1)]
@@ -54,19 +53,19 @@ def test_reply_to_summarized_voice_uses_exact_transcript_not_multitopic_recap():
     graph = shared_dialogue(
         mem, (-100, 0, 1), [Entry((10,), 10, "Уточнение")], (reference,), 10, 10
     )
-    assert next(n.text for n in graph.messages if n.message_id == 1) == reference.text
+    assert next(n.text for n in graph.messages if n.message_id == 1) == ""
     assert not graph.has_previous_summary
     assert all(n.kind != "summary" for n in graph.messages)
 
 
-def test_reply_chain_has_bounded_depth_and_excludes_other_scope_and_future():
+def test_reply_chain_is_not_traversed():
     mem = memory()
     for mid in range(1, 11):
         remember(mem, mid, 2, refs=(ref(mid, mid - 1, 2),) if mid > 1 else ())
     remember(mem, 11)
     reference = ref(11, 10, 2)
     graph = shared_dialogue(mem, (-100, 0, 1), [Entry((11,), 11, "Ответ")], (reference,), 11, 11)
-    assert {n.message_id for n in graph.messages} == {8, 9, 10, 11}
+    assert {n.message_id for n in graph.messages} == {10, 11}
 
 
 def test_explicit_other_topic_is_a_leaf_and_never_opens_other_history():

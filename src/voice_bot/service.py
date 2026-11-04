@@ -33,7 +33,7 @@ from voice_bot.conversation import Anchor, ConversationKey, ConversationMemory, 
 from voice_bot.deduplication import ProcessedVoices, RecentResults, voice_keys
 from voice_bot.delivery import ephemeral, forum_topic_id, recipient, reply_to
 from voice_bot.dialogue import DialogueContext, DialogueInput
-from voice_bot.dialogue_graph import CONTEXT_LOOKBACK_SECONDS, shared_dialogue
+from voice_bot.dialogue_graph import shared_dialogue
 from voice_bot.errors import NoSpeechError, ProviderError, RecognitionError, UserFacingError
 from voice_bot.jobs import VoiceJobQueue
 from voice_bot.journal import DeliveryUncertain, QueueJournal, request_key
@@ -47,7 +47,6 @@ from voice_bot.reply_context import (
     ReplyContext,
     as_voice,
     bounded_contexts,
-    media_kind,
     reply_target,
 )
 from voice_bot.stt_context import vocabulary
@@ -82,10 +81,6 @@ def summary_context(message: Message) -> SummaryContext:
         username = user.username
     if name is not None:
         name = " ".join(name.split()) or None
-    reply = getattr(message, "reply_to_message", None)
-    reply_text = (
-        (getattr(reply, "text", None) or getattr(reply, "caption", None)) if reply else None
-    )
     voice = getattr(message, "voice", None)
     return SummaryContext(
         author_name=name,
@@ -97,7 +92,6 @@ def summary_context(message: Message) -> SummaryContext:
         chat_type=getattr(message.chat, "type", None),
         chat_title=getattr(message.chat, "title", None),
         duration_seconds=voice.duration if voice else None,
-        reply_to_text=reply_text[:1000] if reply_text else None,
     )
 
 
@@ -181,7 +175,6 @@ class VoiceService:
             max_entries=settings.context_max_messages,
             path=settings.context_state_file,
             series_gap=settings.context_series_gap_seconds,
-            history_lookback=CONTEXT_LOOKBACK_SECONDS,
         )
         self.dialogue = DialogueContext(self.memory, settings, self._context_allowed)
         self.batcher = VoiceBatcher(
@@ -213,6 +206,17 @@ class VoiceService:
             return
         restored = 0
         for job_id, state, items in self.journal.recover(bot):
+            supported = [item for item in items if as_voice(item[0]) is not None]
+            if len(supported) != len(items):
+                row = self.journal.get(job_id)
+                if supported and row["result"] and row["deliveries"]:
+                    # Resume an immutable reply already being sent before the upgrade.
+                    supported = items
+                elif not self.journal.retain_voices(job_id):
+                    if supported:
+                        logger.warning("voice_queue_migration_requires_review")
+                    continue
+            items = supported
             messages = [item[0] for item in items]
             if not all(self.work_allowed(message) for message in messages):
                 self.journal.finish(job_id)
@@ -299,60 +303,7 @@ class VoiceService:
         return True
 
     async def observe_text(self, message: Message) -> None:
-        text = getattr(message, "text", None) or getattr(message, "caption", None)
-        if (
-            self.batcher.closed
-            or not text
-            or text.lstrip().startswith("/")
-            or getattr(message, "forward_origin", None) is not None
-            or not self.work_allowed(message)
-        ):
-            return
-        position = conversation_position(message)
-        if position is None:
-            return
-        key, sent_at = position
-        author = summary_context(message)
-        refs: tuple[ReplyContext, ...] = ()
-        target = reply_target(message)
-        if target is not None:
-            target_author = summary_context(target)
-            source = (
-                getattr(target, "text", None)
-                or getattr(target, "caption", None)
-                or self.memory.source(message.chat.id, target.message_id)
-                or ""
-            )
-            refs = bounded_contexts(
-                (
-                    ReplyContext(
-                        message.message_id,
-                        target.message_id,
-                        target_author.author_name,
-                        target_author.author_username,
-                        media_kind(target) or "text",
-                        source,
-                        None if source else "Речь исходного сообщения пока недоступна.",
-                        context_author_id(target),
-                    ),
-                ),
-                min(3000, self.settings.context_max_chars // 4),
-            )
-        self.memory.remember(
-            key,
-            sent_at,
-            (message.message_id,),
-            text,
-            kind="text",
-            reply_contexts=refs,
-            anchor=Anchor(
-                message.message_id,
-                author.author_name,
-                author.author_username,
-                getattr(message.chat, "type", None),
-            ),
-        )
-        await self.memory.checkpoint()
+        """Text updates do not contribute to voice summaries or spelling hints."""
 
     def _observe_voice_activity(self, message: Message) -> None:
         position = conversation_position(message)
@@ -420,7 +371,8 @@ class VoiceService:
         return None
 
     async def handle(self, message: Message, bot: Bot) -> None:
-        message = as_voice(message) or message
+        if as_voice(message) is None:
+            return
         if self.work_allowed(message):
             self._observe_voice_activity(message)
         await self._handle_messages([message], bot)
@@ -496,7 +448,8 @@ class VoiceService:
         self, message: Message, bot: Bot, *, requester: Message | None = None
     ) -> None:
         if (
-            self.work_allowed(message)
+            as_voice(message) is not None
+            and self.work_allowed(message)
             and not self.batcher.closed
             and await self._claim(message, requester)
         ):
@@ -549,7 +502,8 @@ class VoiceService:
                         self._release(item, failed=rejected)
 
     async def accept(self, message: Message, bot: Bot) -> None:
-        message = as_voice(message) or message
+        if as_voice(message) is None:
+            return
         if self.batcher.closed:
             return
         if self.admin is not None and message.chat.type in {"group", "supergroup"}:
@@ -763,42 +717,30 @@ class VoiceService:
         return finished
 
     def _transcription_keywords(self, message: Message) -> tuple[str, ...]:
-        if (
-            self.settings.stt_model != "gpt-transcribe"
-            or not self.memory.available
-            or not self.memory.ttl
-        ):
+        if self.settings.stt_model != "gpt-transcribe" or not self.memory.available:
             return ()
-        self.memory.purge()
-        typed_sources: list[str] = []
-        recognized_sources: list[str] = []
-        if caption := getattr(message, "caption", None):
-            typed_sources.append(caption)
-        target = reply_target(message)
-        if target is not None:
-            if text := getattr(target, "text", None) or getattr(target, "caption", None):
-                typed_sources.append(text)
-            if media_kind(target) in {"voice", "video_note"}:
-                known = self.memory.source(message.chat.id, target.message_id)
-                reference = self.memory.reply_source(message.chat.id, target.message_id)
-                if known:
-                    recognized_sources.append(known)
-                elif reference and reference.kind == media_kind(target):
-                    recognized_sources.append(reference.text)
         position = conversation_position(message)
-        if position is not None:
-            key, sent_at = position
-            if session := self.memory.sessions.get(key):
-                entries = [
-                    entry
-                    for entry in session.entries
-                    if 0 <= sent_at - entry.sent_at <= self.settings.context_series_gap_seconds
-                    and (entry.sent_at, max(entry.message_ids)) < (sent_at, message.message_id)
-                ][-3:]
-                # Typed spelling takes precedence over earlier recognition candidates.
-                typed_sources.extend(e.text for e in reversed(entries) if e.kind == "text")
-                recognized_sources.extend(e.text for e in reversed(entries) if e.kind == "voice")
-        return vocabulary((*typed_sources, *recognized_sources))
+        if position is None:
+            return ()
+        key, sent_at = position
+        self.memory.purge()
+        session = self.memory.sessions.get(key)
+        series = self.memory.series_at(key, sent_at)
+        if session is None or series is None:
+            return ()
+        pending = series.voice_count - series.summarized_count
+        if pending <= 0:
+            return ()
+        entries = [
+            entry
+            for entry in session.entries
+            if entry.kind == "voice"
+            and entry.summary is None
+            and max(entry.message_ids) > session.summarized_through
+            and series.started_at <= entry.sent_at <= sent_at
+            and (entry.sent_at, max(entry.message_ids)) < (sent_at, message.message_id)
+        ][-min(3, pending) :]
+        return vocabulary(tuple(entry.text for entry in reversed(entries)))
 
     async def _transcribe(self, message: Message, bot: Bot) -> str:
         settings, voice = self.settings, message.voice
@@ -816,7 +758,7 @@ class VoiceService:
             if not cached.strip():
                 raise NoSpeechError()
             return cached
-        hint_key = "stt-keywords:" + voice_keys(message)[0]
+        hint_key = "voice-block-keywords:" + voice_keys(message)[0]
         saved_hints = self._result_get(hint_key)
         if saved_hints is None:
             hints = self._transcription_keywords(message)
@@ -880,160 +822,16 @@ class VoiceService:
         target = reply_target(message)
         if target is None:
             return None
-        kind = media_kind(target)
-        if kind is None:
-            return None
-        cache_key = "reply-context:" + voice_keys(message)[0]
-        cached = self._result_get(cache_key)
-        if cached is not None:
-            raw = json.loads(cached)
-            if raw.get("pending_media"):
-                raw["pending_media"] = PendingReplyMedia(**raw["pending_media"])
-            saved = ReplyContext(**raw)
-            if (
-                saved.kind == kind
-                and saved.reply_to_message_id == target.message_id
-                and (saved.pending_media is None or defer_media)
-            ):
-                return saved
-        previous = self.memory.reply_source(message.chat.id, target.message_id)
-        if kind != "text" and previous is not None and previous.kind == kind:
-            author = summary_context(target)
-            context = replace(
-                previous,
-                message_id=message.message_id,
-                author_name=author.author_name,
-                author_username=author.author_username,
-                author_id=context_author_id(target),
-            )
-            self._result_put(cache_key, json.dumps(asdict(context), ensure_ascii=False))
-            return context
-        caption = getattr(target, "text", None) or getattr(target, "caption", None) or ""
-        source = caption if kind == "text" else ""
-        unavailable = None
-        pending = None
-        if kind != "text":
-            # Exact message lookup: no unrelated history of the other author is read.
-            source = self.memory.source(message.chat.id, target.message_id) or ""
-            media = as_voice(target)
-            if not source and media is not None:
-                source = self._result_get("transcript:" + voice_keys(media, scoped=False)[-1]) or ""
-            if not source and media is not None and defer_media:
-                assert media.voice is not None
-                pending = PendingReplyMedia(
-                    media.voice.file_id,
-                    media.voice.file_unique_id,
-                    media.voice.duration,
-                    media.voice.file_size,
-                    target.date.timestamp(),
-                )
-                unavailable = "Источник будет распознан при составлении итога."
-                media = None
-            if not source and media is not None:
-                try:
-                    if recipient(message):
-                        media = media.model_copy(update={"receiver_user": message.receiver_user})
-                    remaining = 45.0
-                    if deadline is not None:
-                        remaining = max(
-                            0.0, min(remaining, deadline - asyncio.get_running_loop().time() - 15)
-                        )
-                    async with asyncio.timeout(remaining):
-                        source = await self._transcribe(media, bot)
-                except (ProviderError, UserFacingError, TimeoutError, TelegramAPIError):
-                    unavailable = "Не удалось получить речь из исходного сообщения."
-                    logger.info(
-                        "reply_context_unavailable message_id=%s target_id=%s",
-                        message.message_id,
-                        target.message_id,
-                    )
-                except Exception as exc:
-                    logger.warning("reply_context_failed error_type=%s", type(exc).__name__)
-                    unavailable = "Контекст исходного сообщения недоступен."
-            if caption:
-                source = f"Подпись: {caption}\nРечь: {source}" if source else f"Подпись: {caption}"
-        if not source and not unavailable:
-            return None
         author = summary_context(target)
-        context = bounded_contexts(
-            (
-                ReplyContext(
-                    message_id=message.message_id,
-                    reply_to_message_id=target.message_id,
-                    author_name=author.author_name,
-                    author_username=author.author_username,
-                    kind=kind,
-                    text=source,
-                    unavailable_reason=unavailable,
-                    author_id=context_author_id(target),
-                    pending_media=pending,
-                ),
-            ),
-            min(3000, self.settings.context_max_chars // 4),
-        )[0]
-        self._result_put(cache_key, json.dumps(asdict(context), ensure_ascii=False))
-        return context
-
-    async def _resolve_pending_replies(
-        self,
-        key: ConversationKey,
-        dialogue: DialogueInput,
-        message: Message,
-        bot: Bot,
-        deadline: float,
-    ) -> None:
-        """Deferred sources survive restarts with the bounded context snapshot."""
-        resolved: dict[int, ReplyContext] = {}
-        for ref in dialogue.reply_contexts:
-            pending = ref.pending_media
-            if pending is None:
-                continue
-            media = {
-                "file_id": pending.file_id,
-                "file_unique_id": pending.file_unique_id,
-                "duration": pending.duration,
-                "file_size": pending.file_size,
-            }
-            if ref.kind == "video_note":
-                media["length"] = 240
-            target = Message.model_validate(
-                {
-                    "message_id": ref.reply_to_message_id,
-                    "date": pending.date,
-                    "chat": {"id": key[0], "type": getattr(message.chat, "type", "supergroup")},
-                    "from_user": {
-                        "id": ref.author_id or 0,
-                        "is_bot": False,
-                        "first_name": ref.author_name or "Автор",
-                    },
-                    ref.kind: media,
-                }
-            )
-            caller = Message.model_validate(
-                {
-                    "message_id": ref.message_id,
-                    "date": message.date,
-                    "chat": target.chat,
-                    "from_user": message.from_user,
-                    "reply_to_message": target,
-                }
-            )
-            result = await self._reply_context(caller, bot, deadline=deadline)
-            if result is not None:
-                resolved[ref.message_id] = replace(
-                    result,
-                    author_id=ref.author_id,
-                    author_name=ref.author_name,
-                    author_username=ref.author_username,
-                )
-        session = self.memory.sessions.get(key)
-        if session is not None and resolved:
-            session.entries = [
-                replace(
-                    e, reply_contexts=tuple(resolved.get(r.message_id, r) for r in e.reply_contexts)
-                )
-                for e in session.entries
-            ]
+        return ReplyContext(
+            message.message_id,
+            target.message_id,
+            author.author_name,
+            author.author_username,
+            "recipient",
+            "",
+            author_id=context_author_id(target),
+        )
 
     async def _process(
         self,
@@ -1099,22 +897,10 @@ class VoiceService:
                 if not any(part is not None for part in transcripts):
                     return await self._silent_result(messages, ignored)
                 transcript = self._joined(transcripts, failures)
-                due = None
-                if not is_batch and transcripts[0] is not None:
-                    due = self.dialogue.prepare(
-                        key,
-                        min(times) if times else 0,
-                        message.message_id,
-                        transcript,
-                        message.voice.duration,
-                        force=needs_summary,
-                    )
                 references: list[ReplyContext] = []
                 for item, recognized in zip(messages, transcripts, strict=True):
                     if recognized is not None:
-                        reference = await self._reply_context(
-                            item, bot, deadline=deadline, defer_media=not (needs_summary or due)
-                        )
+                        reference = await self._reply_context(item, bot)
                         if reference is not None:
                             references.append(reference)
                 reply_contexts = bounded_contexts(
@@ -1133,22 +919,6 @@ class VoiceService:
                         force=needs_summary,
                     )
                     if dialogue is not None:
-                        if key is not None and any(
-                            r.pending_media for r in dialogue.reply_contexts
-                        ):
-                            await self._resolve_pending_replies(
-                                key, dialogue, message, bot, deadline
-                            )
-                            dialogue = self.dialogue.prepare(
-                                key,
-                                min(times) if times else 0,
-                                message.message_id,
-                                transcript,
-                                message.voice.duration,
-                                reply_contexts=reply_contexts,
-                                force=needs_summary,
-                            )
-                            assert dialogue is not None
                         needs_summary = True
                         summary_input = dialogue.text
                         summary = (
@@ -1196,8 +966,7 @@ class VoiceService:
                             min(times),
                             message.message_id,
                         )
-                        if graph.candidates:
-                            context = replace(context, dialogue=graph)
+                        context = replace(context, dialogue=graph)
                     if is_batch:
                         if reply_contexts:
                             summary_input = "\n\n".join(
@@ -1336,7 +1105,11 @@ class VoiceService:
             # Normalize only routing; keep author/forward scope and frozen output intact.
             key = (key[0], forum_topic_id(message) or 0, *key[2:])
         times = prepared["times"]
-        if all(prepared["valid"]) and self.chat_allowed(message):
+        if (
+            all(prepared["valid"])
+            and all(as_voice(item) is not None for item in messages)
+            and self.chat_allowed(message)
+        ):
             self.memory.remember(
                 key,
                 max(times) if times else 0,

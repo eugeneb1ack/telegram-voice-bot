@@ -1,17 +1,12 @@
 import asyncio
-import json
-from dataclasses import replace
 
-import httpx
 import pytest
 from test_dialogue import setup, text, voice
-from test_reply_context import foreign_message
 
-from voice_bot.conversation import Anchor, ConversationMemory, Entry
+from voice_bot.conversation import Anchor, ConversationMemory
 from voice_bot.dialogue import DialogueContext
 from voice_bot.dialogue_graph import shared_dialogue
 from voice_bot.errors import ProviderError
-from voice_bot.providers import APIClient, HTTPSummarizer, SummaryContext
 from voice_bot.reply_context import ReplyContext
 
 
@@ -54,18 +49,6 @@ def test_recipients_use_ids_and_unaddressed_message_is_separate():
     ]
     assert [b.is_reply for b in graph.branches] == [True, True, False]
     assert all(n.author_id == 1 for n in graph.messages if n.message_id >= 10)
-
-
-def test_own_reply_chain_follows_original_recipient_and_cycles_terminate():
-    mem = memory()
-    refs = (ref(10, 1, 2), ref(11, 10, 1), ref(12, 13, 1), ref(13, 12, 1))
-    for mid in (10, 11, 12, 13):
-        remember(mem, mid)
-    graph = shared_dialogue(mem, (-100, 0, 1), mem.sessions[(-100, 0, 1)].entries, refs, 14, 14)
-    assert [(b.recipient_id, b.message_ids) for b in graph.branches] == [
-        (2, (10, 11)),
-        (None, (12, 13)),
-    ]
 
 
 def test_twenty_unlinked_participants_keep_separate_counts_and_sources(settings):
@@ -183,7 +166,7 @@ async def test_long_voice_after_restart_does_not_wait_for_triplet(settings):
     await service.close()
 
 
-async def test_text_eviction_and_restart_do_not_shift_third_voice(settings):
+async def test_ignored_text_and_restart_preserve_complete_third_voice(settings):
     settings.context_max_messages = 2
     service, bot, _ = setup(settings)
     await voice(service, bot, 1, seconds=0)
@@ -193,8 +176,8 @@ async def test_text_eviction_and_restart_do_not_shift_third_voice(settings):
     await service.close()
     service, bot, _ = setup(settings)
     last = await voice(service, bot, 10, seconds=100)
-    assert "Коротко · 3 голосовых (доступная часть серии):" in last.answer.await_args.args[0]
-    assert service.summarizer.summarize.await_args.kwargs["context"].dialogue.partial
+    assert "Коротко · 3 голосовых:" in last.answer.await_args.args[0]
+    assert not service.summarizer.summarize.await_args.kwargs["context"].dialogue.partial
     for mid in (11, 12, 13):
         last = await voice(service, bot, mid, seconds=mid * 10)
     assert "Коротко · 3 голосовых:" in last.answer.await_args.args[0]
@@ -226,133 +209,3 @@ async def test_future_text_while_stt_pending_does_not_move_series(settings):
     later = await voice(service, bot, 5, seconds=960)
     assert "Коротко" not in later.answer.await_args.args[0]
     await service.close()
-
-
-async def test_old_snapshot_restores_cadence_and_reply_without_author_id(tmp_path):
-    from dataclasses import asdict
-
-    path = tmp_path / "context.json"
-    mem = memory(path=path)
-    remember(mem, 1, refs=(ref(1, 99, 2),))
-    remember(mem, 2)
-    session = asdict(mem.sessions[(-100, 0, 1)])
-    del session["series"]
-    del session["entries"][0]["reply_contexts"][0]["author_id"]
-    path.write_text(json.dumps({"version": 1, "sessions": [[[-100, 0, 1], session]]}))
-    restored = memory(path=path)
-    assert restored.available
-    assert restored.series_at((-100, 0, 1), 3).voice_count == 2
-    assert restored.sessions[(-100, 0, 1)].entries[0].reply_contexts[0].author_id is None
-
-
-def test_shared_background_has_one_budget_for_all_authors():
-    mem = memory(max_chars=200)
-    for author in range(1, 21):
-        mem.remember((-100, 0, author), author, (author,), "длинная реплика " * 100)
-    sources = [Entry((50 + i,), 50 + i, "Фокус") for i in range(20)]
-    refs = tuple(replace(ref(50 + i, i + 1, i + 1), text="Контекст " * 100) for i in range(20))
-    graph = shared_dialogue(mem, (-100, 0, 1), sources, refs, 70, 70)
-    assert 0 < sum(len(n.text) for n in graph.messages if n.message_id < 50) <= 200
-    assert len(graph.messages) <= 100
-
-
-def test_other_participants_keep_explicit_source_and_reply_edge():
-    mem = memory()
-    remember(mem, 1, 3)
-    remember(mem, 10, 2, refs=(ref(10, 1, 3, kind="video_note"),))
-    remember(mem, 20, refs=(ref(20, 10, 2),))
-    graph = shared_dialogue(
-        mem, (-100, 0, 1), mem.sessions[(-100, 0, 1)].entries, (ref(20, 10, 2),), 21, 21
-    )
-    nodes = {n.message_id: n for n in graph.messages}
-    assert nodes[10].author_id == 2 and nodes[10].reply_to_message_id == 1
-    assert nodes[1].author_id == 3 and nodes[1].kind == "video_note"
-    assert nodes[1].text == "Текст источника"
-
-
-async def test_round_video_participates_in_own_series_and_ordinary_video_only_caption(settings):
-    service, bot, _ = setup(settings)
-    first = foreign_message(chat=123, kind="video_note")
-    first = first.model_copy(
-        update={"video_note": first.video_note.model_copy(update={"duration": 10})}
-    )
-    from unittest.mock import AsyncMock
-
-    original_send = service.send
-    service.send = AsyncMock(return_value=900)
-    service.transcriber.transcribe.return_value = "Это речь из кружка"
-    await service.handle(first, bot)
-    service.send = original_send
-    await voice(service, bot, 2, author=444, seconds=10)
-    third = await voice(service, bot, 3, author=444, seconds=20)
-    assert "Коротко · 3 голосовых:" in third.answer.await_args.args[0]
-    assert "речь из кружка" in service.summarizer.summarize.await_args.args[0]
-    video = foreign_message(chat=123, kind="video").model_copy(
-        update={"message_id": 4, "caption": "Подпись видео"}
-    )
-    await service.observe_text(video)
-    assert service.transcriber.transcribe.await_count == 3
-    assert service.memory.sessions[(123, 0, 444)].series[0].voice_count == 3
-    assert any(
-        e.text == "Подпись видео" and e.kind == "text"
-        for e in service.memory.sessions[(123, 0, 444)].entries
-    )
-    await service.close()
-
-
-@pytest.mark.parametrize(
-    "invalid",
-    [
-        None,
-        {},
-        {"summary": 4},
-        {"b1": "старый формат"},
-        {"summary": ""},
-        {"summary": "x", "extra": "x"},
-    ],
-)
-@pytest.mark.parametrize("previous", [False, True])
-async def test_structured_summary_is_one_narrative_with_grounded_recipients(
-    settings, invalid, previous
-):
-    graph = replace(branch_fixture(), candidates=(), has_previous_summary=previous)
-    context = SummaryContext(author_name="Антон", is_conversation=True, dialogue=graph)
-    body = "Антона интересует кот Анны; у другого собеседника он уточняет детали и проверяет бота."
-    calls = []
-
-    def respond(request):
-        payload = json.loads(request.content)
-        calls.append(payload)
-        schema = payload["text"]["format"]["schema"]
-        assert schema["required"] == ["summary"]
-        assert schema["additionalProperties"] is False
-        data = json.loads(payload["input"])
-        assert data["dialogue"]["focus_author_id"] == 1
-        primary = data["dialogue"]["primary_messages"]
-        assert [m["reply_to"]["speaker"]["id"] if m["reply_to"] else None for m in primary] == [
-            2,
-            3,
-            None,
-            2,
-        ]
-        answer = {"summary": body} if invalid is None else invalid
-        return httpx.Response(
-            200,
-            json={
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": json.dumps(answer)}],
-                    }
-                ]
-            },
-        )
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        summarizer = HTTPSummarizer(APIClient(client, settings))
-        if invalid is not None:
-            with pytest.raises(ProviderError):
-                await summarizer.summarize("Текст", context=context)
-        else:
-            assert await summarizer.summarize("Текст", context=context) == body
-    assert len(calls) == 1

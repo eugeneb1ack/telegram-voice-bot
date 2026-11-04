@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, replace
 
-from aiogram.types import Message, Voice
+from aiogram.types import Message
 
 
 @dataclass(frozen=True)
@@ -51,7 +51,6 @@ def reply_target(message: Message) -> Message | None:
         or getattr(target, "message_id", 0) <= 0
         or getattr(target, "receiver_user", None) is not None
         or getattr(target, "ephemeral_message_id", None)
-        or media_kind(target) is None
         or not any(
             getattr(target, field, None) is not None
             for field in ("from_user", "sender_chat", "forward_origin")
@@ -69,36 +68,15 @@ def media_kind(message: Message) -> str | None:
 
 
 def as_voice(message: Message) -> Message | None:
-    if getattr(message, "voice", None) is not None:
+    if getattr(message, "voice", None) is not None and not getattr(message, "video_note", None):
         return message
-    media = getattr(message, "video_note", None)
-    if media is None:
-        return None
-    return message.model_copy(
-        update={
-            "voice": Voice(
-                file_id=media.file_id,
-                file_unique_id=media.file_unique_id,
-                duration=media.duration,
-                file_size=media.file_size,
-            )
-        }
-    )
+    return None
 
 
 def bounded_contexts(
     contexts: tuple[ReplyContext, ...], max_chars: int
 ) -> tuple[ReplyContext, ...]:
-    result: list[ReplyContext] = []
-    budget = max(0, max_chars)
-    # Cumulative series may contain more than one forwarded batch's ten voices.
-    # Preserve the edges even when the source-text budget is exhausted.
-    for context in contexts[:100]:
-        if context.kind not in {"text", "voice", "video_note"}:
-            continue
-        text = context.text
-        if len(text) > budget:
-            text = text[: max(0, budget - 1)] + ("…" if budget else "")
-        result.append(replace(context, text=text))
-        budget -= len(text)
-    return tuple(result)
+    return tuple(
+        replace(context, kind="recipient", text="", unavailable_reason=None, pending_media=None)
+        for context in contexts[:100]
+    )

@@ -99,7 +99,11 @@ class ConversationMemory:
                 ):
                     raise ValueError
                 data = json.loads(path.read_text())
-                if data["version"] != 1:
+                if data["version"] == 1:
+                    # Legacy snapshots cannot distinguish voices from converted video notes.
+                    logger.info("conversation_history_reset reason=voice_only_policy")
+                    return
+                if data["version"] != 2:
                     raise ValueError
                 adapter = TypeAdapter(list[tuple[ConversationKey, Session]])
                 for key, session in adapter.validate_python(data["sessions"]):
@@ -356,7 +360,7 @@ class ConversationMemory:
         async with self._save_lock:
             self.purge()
             snapshot = json.dumps(
-                {"version": 1, "sessions": [(key, asdict(s)) for key, s in self.sessions.items()]},
+                {"version": 2, "sessions": [(key, asdict(s)) for key, s in self.sessions.items()]},
                 ensure_ascii=False,
             )
             if snapshot == self._saved:

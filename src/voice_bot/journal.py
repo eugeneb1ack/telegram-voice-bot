@@ -72,15 +72,21 @@ def pack(message: Message, *, include_reply: bool = True) -> dict[str, Any]:
         "ephemeral_message_id",
     }
     data = message.model_dump(mode="json", include=fields, exclude_none=True)
-    if message.caption:
-        data["caption"] = message.caption[:8000]
-    if not include_reply:
-        if message.text:
-            data["text"] = message.text[:8000]
-    else:
+    if include_reply:
         target = reply_target(message)
         if target is not None:
-            data["reply_to_message"] = pack(target, include_reply=False)
+            data["reply_to_message"] = target.model_dump(
+                mode="json",
+                include={
+                    "message_id",
+                    "date",
+                    "chat",
+                    "from_user",
+                    "sender_chat",
+                    "forward_origin",
+                },
+                exclude_none=True,
+            )
     return data
 
 
@@ -183,6 +189,29 @@ class QueueJournal:
                 if key != job_id:
                     self.db.execute("DELETE FROM jobs WHERE id=?", (key,))
         return job_id
+
+    @durable
+    def retain_voices(self, job_id: str) -> bool:
+        row = self.get(job_id)
+        payload = [
+            item
+            for item in row["payload"]
+            if item["message"].get("voice") and not item["message"].get("video_note")
+        ]
+        if len(payload) == len(row["payload"]):
+            return True
+        if not payload:
+            self.finish(job_id)
+            return False
+        if row["deliveries"]:
+            self.set(job_id, "state", "uncertain")
+            return False
+        with self.transaction():
+            self.db.execute(
+                "UPDATE jobs SET payload=?, result=NULL WHERE id=?",
+                (json.dumps(payload), job_id),
+            )
+        return True
 
     @durable
     def get(self, job_id: str) -> dict[str, Any]:

@@ -64,7 +64,7 @@ async def test_each_triplet_gets_one_reply_with_only_its_new_sources(settings):
     await service.close()
 
 
-async def test_text_is_source_not_a_voice_counter_and_out_of_order_stt_keeps_event_order(settings):
+async def test_text_is_ignored_and_out_of_order_stt_keeps_voice_order(settings):
     service, bot, _ = setup(settings)
     await text(service, 1, "Встреча завтра в пять.")
     entered, release = asyncio.Event(), asyncio.Event()
@@ -88,7 +88,8 @@ async def test_text_is_source_not_a_voice_counter_and_out_of_order_stt_keeps_eve
     await service.dialogue.maintain()
     source = service.summarizer.summarize.await_args.args[0]
     assert "Встреча" not in source
-    assert source.index("Место") < source.index("Уточнение")
+    assert "Уточнение" not in source
+    assert source.index("Место") < source.index("Мысль 4")
     assert "Коротко · 3 голосовых:" in last.answer.await_args.args[0]
     assert last.answer.await_args.kwargs["reply_parameters"].message_id == 5
     bot.send_message.assert_not_awaited()
@@ -378,7 +379,7 @@ async def test_cancelled_checkpoint_finishes_before_newer_snapshot(tmp_path, mon
     memory.clear()
 
 
-async def test_router_collects_only_allowed_human_text_and_never_replies(settings):
+async def test_router_ignores_text_without_collecting_or_replying(settings):
     from aiogram import Bot, Dispatcher
     from aiogram.types import Update
 
@@ -407,8 +408,7 @@ async def test_router_collects_only_allowed_human_text_and_never_replies(setting
                 }
             )
             await dispatcher.feed_update(bot, update)
-        entries = service.memory.sessions[(123, 0, 222)].entries
-        assert [e.text for e in entries] == ["Уточнение плана"]
+        assert not service.memory.sessions
         service.transcriber.transcribe.assert_not_awaited()
         service.summarizer.summarize.assert_not_awaited()
     finally:
@@ -416,12 +416,13 @@ async def test_router_collects_only_allowed_human_text_and_never_replies(setting
         await bot.session.close()
 
 
-async def test_disabled_summaries_still_remove_expired_text_from_disk(settings):
+async def test_disabled_summaries_still_remove_expired_transcripts_from_disk(settings):
     service, bot, _ = setup(settings)
     settings.context_summary_every = 0
     now = [10.0]
     service.memory.clock = lambda: now[0]
-    await text(service, 1, "Истекающий текст")
+    service.memory.remember((123, 0, 222), 10.0, (1,), "Истекающий текст")
+    await service.memory.checkpoint()
     assert "Истекающий текст" in settings.context_state_file.read_text()
     now[0] += service.memory.retention + 1
     service.start(bot)
@@ -457,7 +458,7 @@ async def test_expired_series_never_contributes_to_new_triplet(settings, old_cou
     service, bot, _ = setup(settings)
     for mid in range(1, old_count + 1):
         await voice(service, bot, mid, seconds=(mid - 1) * 20)
-    # Text keeps source storage alive, but cannot extend the voice series.
+    # Text neither enters the source block nor extends the voice series.
     await text(service, 3, "Старая текстовая тема.", seconds=pause - 1)
     if restart:
         await service.close()
@@ -467,7 +468,6 @@ async def test_expired_series_never_contributes_to_new_triplet(settings, old_cou
         assert ("Коротко" in message.answer.await_args.args[0]) == (mid == 6)
     context = service.summarizer.summarize.await_args.kwargs["context"]
     assert [n.message_id for n in context.dialogue.messages] == [4, 5, 6]
-    assert all(n.message_id not in range(1, old_count + 1) for n in context.dialogue.candidates)
     await service.close()
 
 

@@ -2,11 +2,12 @@
 
 [English](README.md) | [Русский](README.ru.md)
 
-Telegram bot that transcribes voice messages and round video notes using OpenAI.
+Telegram bot that transcribes voice messages using OpenAI.
 
 - Full transcripts in expandable quotes, with a typing indicator during processing.
 - Summaries for recordings of at least 15 seconds, or each new group of three shorter recordings within 10 minutes.
-- Reply context from transcripts, text and captions; separate counters per user, chat and topic.
+- Summaries use only the current voice recordings; separate counters per user, chat and topic.
+- Text, captions, video notes and earlier voice blocks are excluded. Reply recipient names are preserved.
 - Automatic processing or quiet mode with private `/text` replies.
 - Persistent queue for restart recovery. No reply when speech is not recognized.
 
@@ -46,6 +47,6 @@ For groups, make the bot an administrator, then approve the group through `/admi
 | `/start` | Show help |
 | `/admin` | Approve or block groups; owner only |
 
-State is stored in the Docker volume. Audio and selected text context are sent to OpenAI for processing.
+State is stored in the Docker volume. Audio and its transcripts are sent to OpenAI for processing.
 
 [MIT License](LICENSE)

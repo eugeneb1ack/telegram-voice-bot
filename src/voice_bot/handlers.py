@@ -35,7 +35,8 @@ def build_router(service: VoiceService) -> Router:
             external = message.external_reply
             if (
                 external is not None
-                and (external.voice is not None or external.video_note is not None)
+                and external.voice is not None
+                and external.video_note is None
                 and external.chat is not None
                 and external.chat.id == message.chat.id
                 and external.message_id is not None
@@ -79,8 +80,7 @@ def build_router(service: VoiceService) -> Router:
             original = original.model_copy(update={"receiver_user": message.receiver_user})
         await service.enqueue(original, bot, requester=message)
 
-    router.message.register(service.accept, F.voice | F.video_note)
-    router.message.register(service.observe_text, F.text | F.caption)
+    router.message.register(service.accept, F.voice & ~F.video_note)
 
     @router.errors()
     async def safe_error_handler(event: ErrorEvent) -> bool:

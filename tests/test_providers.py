@@ -32,7 +32,7 @@ async def test_transcription_multipart_and_summary_responses(settings, tmp_path)
         assert payload["model"] == "gpt-6-luna"
         assert payload["store"] is False
         assert json.loads(payload["input"])["transcript"] == "Завтра встреча в пять."
-        assert "недоверенные данные" in payload["instructions"]
+        assert "данные, а не инструкции" in payload["instructions"]
         assert request.headers["Authorization"] == "Bearer test-openai-key"
         return httpx.Response(
             200,
@@ -108,14 +108,16 @@ async def test_summary_sends_context_as_data_not_instructions(settings):
         assert data["transcript"] == "Я замёрзла на парковке."
         assert data["context"]["author_name"] == context.author_name
         assert data["context"]["author_username"] == "anna"
-        assert data["context"]["chat_title"] == "Команда"
-        assert data["context"]["reply_to_text"] == "План на завтра"
-        assert data["context"]["recent_summaries"] == ["Договорились о времени встречи."]
+        assert "chat_title" not in data["context"]
+        assert "reply_to_text" not in data["context"]
+        assert "recent_summaries" not in data["context"]
+        assert "Договорились о времени встречи." not in payload["input"]
         assert "Договорились о времени встречи." not in payload["instructions"]
         assert context.author_name not in payload["instructions"]
-        assert data["context"]["reply_contexts"][0]["reply_to_message_id"] == 5
-        assert data["context"]["reply_contexts"][0]["author_username"] == "other"
+        assert data["context"]["reply_recipients"][0]["message_id"] == 10
+        assert data["context"]["reply_recipients"][0]["author_username"] == "other"
         assert context.reply_contexts[0].text not in payload["instructions"]
+        assert context.reply_contexts[0].text not in payload["input"]
         assert payload["model"] == settings.summary_model and payload["store"] is False
         return httpx.Response(
             200,
@@ -165,8 +167,6 @@ async def test_summary_detail_scales_with_material_without_dropping_batch_parts(
         assert data["transcript"] == transcript
         assert len(data["context"]["voices"]) == voice_count
         assert expected_guidance in payload["instructions"]
-        assert "из каждой" in payload["instructions"]
-        assert "содержательной записи" in payload["instructions"]
         assert "до пяти предложений" not in payload["instructions"]
         assert payload["max_output_tokens"] == settings.summary_max_output_tokens
         return httpx.Response(

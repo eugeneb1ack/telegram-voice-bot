@@ -172,7 +172,7 @@ async def test_summary_result_prioritizes_name_even_when_model_omits_author(
     assert metadata["author_name"] == name
     assert metadata["author_username"] == username
     assert metadata["voices"][0]["author_name"] == "Олег"
-    assert metadata["reply_contexts"][0]["author_name"] == "Ирина"
+    assert metadata["reply_recipients"][0]["author_name"] == "Ирина"
     assert "anna_nickname" not in payload["instructions"]
     assert payload["max_output_tokens"] == settings.summary_max_output_tokens
     assert payload["model"] == settings.summary_model
