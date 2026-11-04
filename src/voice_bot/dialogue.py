@@ -59,12 +59,17 @@ class DialogueContext:
             return None
         if not series.summarized_count:
             through = max(session.summarized_through, session.claimed_through)
-            series.summarized_count = sum(
-                len(e.message_ids)
+            counted = [
+                e
                 for e in session.entries
                 if e.kind == "voice"
                 and e.sent_at >= series.started_at
-                and max(e.message_ids) <= through
+                and max(e.message_ids) <= series.counted_through
+            ]
+            series.summarized_count = sum(
+                len(e.message_ids)
+                for e in (counted[-series.voice_count :] if series.voice_count else [])
+                if max(e.message_ids) <= through
             )
             series.covered_count = max(series.covered_count or 0, series.summarized_count)
         count = series.voice_count + int(message_id > series.counted_through)

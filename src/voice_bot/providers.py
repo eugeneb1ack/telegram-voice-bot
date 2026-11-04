@@ -68,20 +68,21 @@ def summary_length_hint(transcript: str, context: SummaryContext | None, setting
     if words <= settings.summary_short_input_words:
         target = settings.summary_short_target_words
         lower_ratio = 0.75
-        form = "Короткая запись: 1–2 содержательных предложения в одном абзаце"
+        form = "Короткая запись: 1–2 предложения; для нескольких самостоятельных мыслей — до трёх"
     elif words <= settings.summary_long_input_words and not multiple_topics:
         target = settings.summary_medium_target_words
         lower_ratio = 0.875
-        form = "Развёрнутая запись: 3–4 содержательных предложения в 1–2 абзацах"
+        form = "Развёрнутая запись: 2–3 содержательных предложения"
     else:
         target = settings.summary_long_target_words
         lower_ratio = 2 / 3
-        form = "Большой объём материала: 5–7 содержательных предложений в 2–3 коротких абзацах"
+        form = "Большой объём материала: 5–7 содержательных предложений"
     # A short source must not expand to fill a larger configured word target.
     upper = min(target, max(1, words * 3 // 4))
     lower = max(1, int(upper * lower_ratio))
     return (
-        f"{form}, ориентир — {lower}–{upper} слов, включая имя автора. "
+        f"{form}, ориентир — {lower}–{upper} слов, включая имя участника. "
+        "Обычно достаточно одного абзаца; новый абзац нужен при смене темы. "
         "Сокращай за счёт повторов и вводных слов, "
         "сохраняй самостоятельные мысли и причинные связи. "
         "Выбирай основные тезисы и существенные оговорки, второстепенные детали опускай. "
@@ -215,6 +216,8 @@ class HTTPSummarizer:
             f"Кратко перескажи только transcript на языке {settings.summary_language}. "
             "Пиши связным текстом от третьего лица, без заголовков и списков. "
             "Передай основные мысли каждой записи по порядку, убрав повторы. "
+            "Не придумывай связь между разными темами. "
+            "Имена и адресатов повторяй только для ясности. "
             "Сохраняй вопросы, отрицания, условия, сомнения и планы. "
             "Не добавляй фактов, причин или расшифровок неясных отсылок. "
             "voices указывает авторов записей; reply_recipients — только адресатов, "

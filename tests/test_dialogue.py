@@ -478,3 +478,118 @@ async def test_last_voice_before_ten_minutes_still_completes_triplet(settings):
     assert "Коротко · 3 голосовых:" in message.answer.await_args.args[0]
     assert all(f"Мысль {i}." in service.summarizer.summarize.await_args.args[0] for i in (1, 2, 3))
     await service.close()
+
+
+@pytest.mark.parametrize("restart", [0, 3, 5])
+@pytest.mark.parametrize("first_block", ["triplet", "long", "failed"])
+async def test_next_block_gets_its_own_ten_minutes(settings, restart, first_block):
+    service, bot, _ = setup(settings)
+    if first_block == "failed":
+        service.summarizer.summarize.side_effect = TimeoutError()
+    for mid in (1, 2, 3) if first_block != "long" else (3,):
+        await voice(
+            service, bot, mid, seconds=(mid - 1) * 20, duration=20 if first_block == "long" else 10
+        )
+    service.summarizer.summarize.side_effect = None
+    if restart == 3:
+        await service.close()
+        service, bot, _ = setup(settings)
+    for mid, seconds in [(4, 540), (5, 570)]:
+        await voice(service, bot, mid, seconds=seconds)
+    if restart == 5:
+        await service.close()
+        service, bot, _ = setup(settings)
+    last = await voice(service, bot, 6, seconds=650)
+    assert "Коротко · 3 голосовых:" in last.answer.await_args.args[0]
+    call = service.summarizer.summarize.await_args
+    assert call.kwargs["context"].dialogue.branches[0].message_ids == (4, 5, 6)
+    assert all(f"Мысль {i}." not in call.args[0] for i in (1, 2, 3))
+    await service.close()
+
+
+async def test_future_admissions_cannot_choose_the_next_block_window(settings):
+    service, bot, _ = setup(settings)
+    await voice(service, bot, 1, seconds=0)
+    await voice(service, bot, 2, seconds=20)
+    # These jobs arrive while the third is still being processed.
+    for mid, seconds in [(4, 540), (5, 570), (6, 650)]:
+        service._observe_voice_activity(identified_message(mid, seconds=seconds, duration=10))
+    await voice(service, bot, 3, seconds=40)
+    for mid, seconds in [(4, 540), (5, 570), (6, 650)]:
+        last = await voice(service, bot, mid, seconds=seconds)
+    assert "Коротко · 3 голосовых:" in last.answer.await_args.args[0]
+    assert service.summarizer.summarize.await_count == 2
+    assert service.summarizer.summarize.await_args.kwargs["context"].dialogue.branches[
+        0
+    ].message_ids == (4, 5, 6)
+    await service.close()
+
+
+async def test_completed_block_and_next_block_can_share_telegram_timestamp(settings):
+    service, bot, _ = setup(settings)
+    for mid in range(1, 7):
+        await voice(service, bot, mid, seconds=0)
+        assert service.summarizer.summarize.await_count == mid // 3
+    assert service.summarizer.summarize.await_args.kwargs["context"].dialogue.branches[
+        0
+    ].message_ids == (4, 5, 6)
+    await service.close()
+
+
+async def test_upgrade_preserves_pending_voices_in_an_old_cumulative_series(settings):
+    service, bot, _ = setup(settings)
+    for mid, seconds in [(1, 0), (2, 20), (3, 40), (4, 540), (5, 570)]:
+        await voice(service, bot, mid, seconds=seconds)
+    await service.close()
+    snapshot = json.loads(settings.context_state_file.read_text())
+    session = snapshot["sessions"][0][1]
+    session["series"] = [
+        dict(
+            started_at=session["entries"][0]["sent_at"],
+            last_at=session["entries"][-1]["sent_at"],
+            voice_count=5,
+            counted_through=5,
+            summarized_count=3,
+            summary_offset=0,
+            covered_count=3,
+        )
+    ]
+    settings.context_state_file.write_text(json.dumps(snapshot))
+    service, bot, _ = setup(settings)
+    last = await voice(service, bot, 6, seconds=650)
+    assert "Коротко · 3 голосовых:" in last.answer.await_args.args[0]
+    assert service.summarizer.summarize.await_args.kwargs["context"].dialogue.branches[
+        0
+    ].message_ids == (4, 5, 6)
+    await service.close()
+
+
+async def test_old_failed_block_stays_closed_across_two_restarts(settings):
+    service, bot, _ = setup(settings)
+    for mid in (1, 2):
+        await voice(service, bot, mid)
+    service.summarizer.summarize.side_effect = TimeoutError()
+    await voice(service, bot, 3)
+    await service.close()
+    snapshot = json.loads(settings.context_state_file.read_text())
+    session = snapshot["sessions"][0][1]
+    session["claimed_through"] = 0
+    session["series"] = [
+        dict(
+            started_at=session["entries"][0]["sent_at"],
+            last_at=session["entries"][-1]["sent_at"],
+            voice_count=3,
+            counted_through=3,
+            summarized_count=3,
+            summary_offset=0,
+            covered_count=0,
+        )
+    ]
+    settings.context_state_file.write_text(json.dumps(snapshot))
+    service, bot, _ = setup(settings)
+    await service.close()
+    service, bot, _ = setup(settings)
+    for mid in (4, 5, 6):
+        await voice(service, bot, mid)
+        assert service.summarizer.summarize.await_count == int(mid == 6)
+    await service.close()

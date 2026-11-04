@@ -58,7 +58,7 @@ class Session:
     entries: list[Entry] = field(default_factory=list)
     summarized_through: int = 0
     anchor: Anchor | None = None
-    # Legacy watermark from separate-message summaries, retained for snapshot compatibility.
+    # Last voice in a closed block, even if its summary request failed.
     claimed_through: int = 0
     series: list[Series] = field(default_factory=list)
 
@@ -133,6 +133,7 @@ class ConversationMemory:
                                 ):
                                     series.summarized_count = series.voice_count
                                     series.covered_count = series.voice_count
+                    self._restore_open_blocks(session)
                     session.expires_at = min(session.expires_at, self.clock() + self.retention)
                     if (
                         (session.entries or session.series)
@@ -226,6 +227,44 @@ class ConversationMemory:
         newest = max(item.last_at for item in session.series)
         session.series = [s for s in session.series if newest - s.last_at <= self.ttl][-MAX_SERIES:]
         return series
+
+    def _restore_open_blocks(self, session: Session) -> None:
+        # Version 2 snapshots may still contain several completed blocks in one series.
+        open_blocks = []
+        for series in session.series:
+            pending = series.voice_count - series.summarized_count
+            if not pending:
+                if series.voice_count:
+                    session.claimed_through = max(session.claimed_through, series.counted_through)
+                continue
+            if series.summarized_count:
+                entries = [
+                    entry
+                    for entry in session.entries
+                    if entry.kind == "voice"
+                    and series.started_at <= entry.sent_at <= series.last_at
+                    and max(entry.message_ids) <= series.counted_through
+                ][-pending:]
+                if sum(len(entry.message_ids) for entry in entries) == pending:
+                    series.started_at = entries[0].sent_at
+                series.voice_count = pending
+                series.summarized_count = series.summary_offset = 0
+                series.covered_count = 0
+            open_blocks.append(series)
+        session.series = open_blocks
+
+    def close_block(self, key: ConversationKey, sent_at: float) -> None:
+        session = self.sessions.get(key)
+        if session is None:
+            return
+        completed = self.series_at(key, sent_at)
+        if completed is not None:
+            session.claimed_through = max(session.claimed_through, completed.counted_through)
+        # Queued jobs can have provisionally opened future windows. Rebuild those
+        # in processing order, from the first recognized voice of the next block.
+        session.series = [
+            series for series in session.series if series is not completed and series.voice_count
+        ]
 
     def activity(self, key: ConversationKey | None, sent_at: float) -> Series | None:
         """Record event timing at admission, independently of bounded source text and STT."""

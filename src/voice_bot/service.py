@@ -1138,19 +1138,13 @@ class VoiceService:
                 else None,
             )
             if prepared["dialogue"] and key is not None and key in self.memory.sessions:
-                series = self.memory.series_at(key, max(times) if times else 0)
-                if series is not None:
-                    series.summarized_count = series.voice_count
-                    if prepared.get("completed_summary"):
-                        self.memory.sessions[key].summarized_through = message.message_id
-                        series.covered_count = series.voice_count
-            elif prepared.get("standalone_summary") and key is not None:
-                series = self.memory.series_at(key, max(times) if times else 0)
-                if series is not None:
-                    series.summarized_count = series.voice_count
-                    series.summary_offset = series.voice_count
-                    series.covered_count = series.voice_count
+                if prepared.get("completed_summary"):
                     self.memory.sessions[key].summarized_through = message.message_id
+                self.memory.close_block(key, max(times) if times else 0)
+            elif prepared.get("standalone_summary") and key is not None:
+                if key in self.memory.sessions:
+                    self.memory.sessions[key].summarized_through = message.message_id
+                self.memory.close_block(key, max(times) if times else 0)
             await self.memory.checkpoint()
         return [
             item
