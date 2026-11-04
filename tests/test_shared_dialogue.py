@@ -99,7 +99,7 @@ def test_twenty_unlinked_participants_keep_separate_counts_and_sources(settings)
 
 async def test_hard_window_restarts_even_with_continuous_activity(settings):
     service, bot, _ = setup(settings)
-    for mid, seconds in [(1, 0), (2, 200), (3, 400), (4, 420), (5, 620), (6, 820)]:
+    for mid, seconds in [(1, 0), (2, 200), (3, 400), (4, 600), (5, 800), (6, 1000)]:
         last = await voice(service, bot, mid, seconds=seconds)
         assert ("Коротко · 3 голосовых:" in last.answer.await_args.args[0]) == (mid in (3, 6))
     call = service.summarizer.summarize.await_args
@@ -147,18 +147,18 @@ async def test_failed_standalone_summary_does_not_mark_voice_as_summarized(setti
 
 
 @pytest.mark.parametrize("preceding", [0, 1, 2, 3])
-@pytest.mark.parametrize("duration", [29, 30, 50])
+@pytest.mark.parametrize("duration", [14, 15, 50])
 async def test_long_voice_always_summarizes_at_any_position(settings, preceding, duration):
     service, bot, _ = setup(settings)
     for mid in range(1, preceding + 1):
         await voice(service, bot, mid, seconds=mid * 10)
     before = service.summarizer.summarize.await_count
     current = await voice(service, bot, preceding + 1, seconds=50, duration=duration)
-    expected = duration >= 30 or preceding == 2
+    expected = duration >= 15 or preceding == 2
     assert ("Коротко" in current.answer.await_args.args[0]) == expected
     assert service.summarizer.summarize.await_count - before == int(expected)
     assert f"Мысль {preceding + 1}." in current.answer.await_args.args[0]
-    if duration >= 30 and preceding == 1:
+    if duration >= 15 and preceding == 1:
         # A long voice closes the pending short context too, so it cannot disappear.
         assert all(
             f"Мысль {mid}." in service.summarizer.summarize.await_args.args[0] for mid in (1, 2)
@@ -258,6 +258,7 @@ def test_shared_background_has_one_budget_for_all_authors():
 
 def test_other_participants_keep_explicit_source_and_reply_edge():
     mem = memory()
+    remember(mem, 1, 3)
     remember(mem, 10, 2, refs=(ref(10, 1, 3, kind="video_note"),))
     remember(mem, 20, refs=(ref(20, 10, 2),))
     graph = shared_dialogue(
@@ -272,6 +273,9 @@ def test_other_participants_keep_explicit_source_and_reply_edge():
 async def test_round_video_participates_in_own_series_and_ordinary_video_only_caption(settings):
     service, bot, _ = setup(settings)
     first = foreign_message(chat=123, kind="video_note")
+    first = first.model_copy(
+        update={"video_note": first.video_note.model_copy(update={"duration": 10})}
+    )
     from unittest.mock import AsyncMock
 
     original_send = service.send
@@ -298,57 +302,43 @@ async def test_round_video_participates_in_own_series_and_ordinary_video_only_ca
 
 @pytest.mark.parametrize(
     "invalid",
-    [None, {}, {"b1": 4, "b2": "x", "b3": "y"}, {"b1": "x", "b2": "x", "b3": "x", "b4": "x"}],
+    [
+        None,
+        {},
+        {"summary": 4},
+        {"b1": "старый формат"},
+        {"summary": ""},
+        {"summary": "x", "extra": "x"},
+    ],
 )
 @pytest.mark.parametrize("previous", [False, True])
-async def test_structured_summary_exact_branches_and_deterministic_names(
+async def test_structured_summary_is_one_narrative_with_grounded_recipients(
     settings, invalid, previous
 ):
-    graph = branch_fixture()
-    graph = replace(
-        graph,
-        candidates=(),
-        has_previous_summary=previous,
-        branches=(
-            graph.branches[0],
-            replace(graph.branches[1], recipient_name=None),
-            graph.branches[2],
-        ),
-    )
-    context = SummaryContext(
-        author_name="Имя автора", author_username="handle", is_conversation=True, dialogue=graph
-    )
+    graph = replace(branch_fixture(), candidates=(), has_previous_summary=previous)
+    context = SummaryContext(author_name="Антон", is_conversation=True, dialogue=graph)
+    body = "Антона интересует кот Анны; у другого собеседника он уточняет детали и проверяет бота."
     calls = []
 
     def respond(request):
         payload = json.loads(request.content)
         calls.append(payload)
         schema = payload["text"]["format"]["schema"]
-        assert schema["required"] == (["recap"] if previous else []) + ["b1", "b2", "b3"]
-        if previous:
-            assert schema["properties"]["recap"]["maxLength"] == 240
+        assert schema["required"] == ["summary"]
         assert schema["additionalProperties"] is False
         data = json.loads(payload["input"])
-        assert "transcript" not in data
-        assert "reply_contexts" not in data["context"]
         assert data["dialogue"]["focus_author_id"] == 1
-        answer = (
-            invalid
-            if invalid is not None
-            else {"b3": "Про бота.", "b2": "Про девушку.", "b1": "Вопрос про кота."}
-        )
-        if previous and invalid is None:
-            answer["recap"] = "Ранее: Обсуждали поездку с котом."
+        assert [b["recipient"] for b in data["dialogue"]["branches"]] == ["Анна", "Анна", None]
+        answer = {"summary": body} if invalid is None else invalid
         return httpx.Response(
             200,
             json={
-                "status": "completed",
                 "output": [
                     {
                         "type": "message",
                         "content": [{"type": "output_text", "text": json.dumps(answer)}],
                     }
-                ],
+                ]
             },
         )
 
@@ -358,11 +348,5 @@ async def test_structured_summary_exact_branches_and_deterministic_names(
             with pytest.raises(ProviderError):
                 await summarizer.summarize("Текст", context=context)
         else:
-            result = await summarizer.summarize("Текст", context=context)
-            assert (
-                result
-                == ("Ранее: Обсуждали поездку с котом.\n\n" if previous else "")
-                + "• Имя автора → Анна:\nВопрос про кота."
-                "\n\n• Имя автора → @user3:\nПро девушку.\n\n• Имя автора:\nПро бота."
-            )
+            assert await summarizer.summarize("Текст", context=context) == body
     assert len(calls) == 1

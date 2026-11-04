@@ -70,6 +70,8 @@ class SharedDialogue:
     has_previous_summary: bool = False
     # Quarantined: candidates are never summary sources before semantic selection.
     candidates: tuple[DialogueMessage, ...] = ()
+    # Absolute event-time cutoff for implicit background, independent of retention.
+    window_start: float | None = None
 
 
 def shared_dialogue(
@@ -135,7 +137,7 @@ def shared_dialogue(
     # target in another forum topic is allowed only as an explicit leaf; we do not
     # crawl that topic's history. Siblings and replies TO our sources never qualify.
     frontier = list(focus_ids)
-    for _ in range(MAX_REPLY_DEPTH):
+    for depth in range(MAX_REPLY_DEPTH):
         following: list[int] = []
         for mid in frontier:
             ref = edges.get(mid)
@@ -148,6 +150,10 @@ def shared_dialogue(
             if len(nodes) >= 100:
                 continue
             cached = candidates.get(target_id)
+            if depth and (
+                cached is None or cached.sent_at is None or cached.sent_at <= sent_at - memory.ttl
+            ):
+                continue
             text = ref.text or (cached.text if cached else "")
             limit = min(budget, 3000)
             if len(text) > limit:
@@ -160,7 +166,9 @@ def shared_dialogue(
                 cached.author_username if cached else ref.author_username,
                 ref.kind,
                 text,
-                cached.reply_to_message_id if cached else None,
+                cached.reply_to_message_id
+                if cached and cached.sent_at is not None and cached.sent_at > sent_at - memory.ttl
+                else None,
                 (ref.unavailable_reason or "Контекст недоступен или ограничен лимитом")
                 if not text
                 else None,
@@ -228,7 +236,9 @@ def shared_dialogue(
             for mid, node in candidate_pool.items()
             if mid in nodes
             or any(
-                within_lookback(nodes[fid], node)
+                node.sent_at is not None
+                and node.sent_at > sent_at - memory.ttl
+                and within_lookback(nodes[fid], node)
                 for fid in focus_ids
                 if nodes[fid].reply_to_message_id is None
             )
@@ -269,4 +279,5 @@ def shared_dialogue(
         branches,
         partial,
         candidates=tuple(sorted(eligible, key=lambda n: n.message_id)),
+        window_start=sent_at - memory.ttl,
     )

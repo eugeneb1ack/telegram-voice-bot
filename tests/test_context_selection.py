@@ -90,3 +90,15 @@ async def test_standalone_summary_does_not_read_unlinked_recent_messages(setting
     context = service.summarizer.summarize.await_args.kwargs["context"]
     assert context.recent_summaries == ()
     await service.close()
+
+
+def test_reply_to_old_source_does_not_pull_its_older_ancestors():
+    mem = memory()
+    remember(mem, 1, 3, time=0)
+    remember(mem, 2, 2, time=1, refs=(ref(2, 1, 3),))
+    remember(mem, 10, time=1000)
+    graph = shared_dialogue(
+        mem, (-100, 0, 1), [Entry((10,), 1000, "Ответ")], (ref(10, 2, 2),), 1000, 10
+    )
+    assert {n.message_id for n in graph.messages} == {2, 10}
+    assert next(n for n in graph.messages if n.message_id == 2).reply_to_message_id is None

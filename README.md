@@ -28,7 +28,7 @@ aggregate summaries are not added automatically. A failed summary does not merge
 its old block into the next one: complete transcripts are already delivered and
 remain available as explicit reply sources. The first two short voices receive
 transcripts only. A
-recording of at least 30 seconds gets an immediate summary at any position in a
+recording of at least 15 seconds gets an immediate summary at any position in a
 series. Pending shorter recordings are included with it, so they cannot disappear. After a
 successful standalone summary, count three new voices. Earlier recordings provide
 background through explicit replies or verified semantic continuation, using their
@@ -38,23 +38,24 @@ standalone summary does not mark the recording as summarized. Forwarded
 batches remain separate. Round video notes count as voices and contribute speech
 only. Ordinary video files are not transcribed; their captions can supply text.
 
-A series spans at most 7 minutes from its first voice. The counter restarts at
+A series spans at most 10 minutes from its first voice. The counter restarts at
 that boundary: two voices followed by a third two hours later never form a triple.
-Text does not extend the boundary. `CONTEXT_SERIES_GAP_SECONDS` (default 420) can
+Text does not extend the boundary. `CONTEXT_SERIES_GAP_SECONDS` (default 600) can
 additionally limit silence between voices; `CONTEXT_TTL_SECONDS` caps total series
 length.
 
 Counters are per author, chat and actual forum topic. Background is selected by
 explicit reply ancestry: the direct target plus at most two earlier ancestors
-already available in memory. Neighbouring messages, sibling replies, the same
+already available in memory and within the ten-minute window. Neighbouring messages, sibling replies, the same
 recipient and temporal proximity alone do not establish a connection. An explicit
 old source is allowed without loading its surrounding history.
 
 Without a reply, a separate bounded semantic selection precedes summary generation:
 at most 12 candidates from the same chat/topic, 6,000 characters total. The search
 window covers five minutes before each primary message, rather than before the final
-summary. Source retention allows that lookback plus the seven-minute series (12 minutes
-with defaults), under the same message/character caps. This does not extend counters.
+summary, with an additional hard cutoff of ten minutes before the current recording.
+Retention may keep source text for up to 15 minutes, under the same message/character
+caps; retained text cannot bypass the selection cutoff or extend counters.
 Existing transcripts, text and captions may clarify a specific reference,
 continuation, correction or answer; a broad shared topic is insufficient. Source IDs,
 chronology and verbatim evidence quotes are validated. Ambiguous links are dropped.
@@ -67,18 +68,14 @@ Multiple possible people, a topic switch or an unproven
 name must not be resolved by guessing. An explicit reply already selected in the
 current block can also clarify its continuation, regardless of the source's age.
 
-Before generation, the application resolves each branch into separate current-speech
-and background lists. It validates primary speakers by Telegram ID; recipient names
-are presentation labels, never speaking-role instructions. Background retains its
-own author and may clarify references without becoming new claims. The model no
-longer joins a flat message graph. Answers use third-person narration, with
-explicit “Author → Recipient” labels; unaddressed speech carries only the author's
-name. Unknown people are explicitly left unspecified. Different recipients remain
-separate. The narration uses the display name instead of a generic “author”, with
-a username fallback when no name is available.
-The summary must preserve negation, uncertainty and limits: listening to music does
-not imply playing it, and one melody played with one finger does not imply general
-proficiency. This adds no model call and does not alter original transcripts.
+Before generation, the application separates current speech from background and checks
+primary authors by Telegram ID. Reply recipients remain data, not speaking-role instructions.
+The model returns one coherent narrative across the branches, without recipient headings
+or bullet lists; two short paragraphs are allowed for genuinely separate topics.
+It names recipients inside the prose when needed and does not invent links between topics.
+Display names are preserved literally, with a username fallback. Background only clarifies
+references and never becomes a new claim. Negation, uncertainty, limits and plans must be
+preserved. This adds no model call and does not alter original transcripts.
 Semantic selection uses the configured summary model
 only before a summary with available candidates. The first two short voices do not
 wait for it. It has a four-second timeout; failure falls back to current messages and
@@ -107,8 +104,8 @@ If the combined result exceeds Telegram’s limit, it is split while preserving 
 entire transcript.
 
 See `CONTEXT_*` in [.env.example](.env.example).
-When upgrading, replace explicitly configured `CONTEXT_TTL_SECONDS=900` and
-`CONTEXT_SERIES_GAP_SECONDS=900` with `420` for the seven-minute window. `CONTEXT_SUMMARY_EVERY=0` disables
+When upgrading, set explicitly configured `CONTEXT_TTL_SECONDS` and
+`CONTEXT_SERIES_GAP_SECONDS` to `600`, and `SUMMARY_MIN_VOICE_SECONDS` to `15`. `CONTEXT_SUMMARY_EVERY=0` disables
 block summaries; `CONTEXT_TTL_SECONDS=0` disables context collection entirely.
 When upgrading, change an explicitly configured `CONTEXT_MAX_CHARS=800` to `12000`.
 
@@ -153,7 +150,7 @@ and content-free counting are omitted from the summary, with full transcripts pr
 
 `gpt-transcribe` receives up to 16 literal vocabulary hints (320 characters total)
 from the explicit reply, the recording's caption and up to three preceding messages
-from the same author, chat and forum topic within the 7-minute context window.
+from the same author, chat and forum topic within the 10-minute context window.
 Existing voice transcripts may contribute vocabulary; source audio is never reprocessed
 just to build hints. Typed spelling takes precedence over earlier speech recognition.
 Only available text is used: an unrecognized referenced recording is not downloaded

@@ -373,9 +373,9 @@ async def test_voice_reply_collapsible_transcript_and_cleanup(settings):
 
 
 @pytest.mark.parametrize(
-    "duration,expected_summary", [(0, 0), (14, 0), (15, 0), (20, 0), (29, 0), (30, 1), (31, 1)]
+    "duration,expected_summary", [(0, 0), (14, 0), (15, 1), (20, 1), (29, 1), (30, 1), (31, 1)]
 )
-async def test_short_notes_are_transcribed_and_summary_starts_at_thirty_seconds(
+async def test_short_notes_are_transcribed_and_summary_starts_at_fifteen_seconds(
     settings, duration, expected_summary
 ):
     service, bot, _ = make_dependencies(settings)
@@ -1331,7 +1331,7 @@ async def test_deleted_cached_reply_falls_back_to_processing(settings):
 
 async def test_legacy_receipt_without_reply_id_never_silently_drops_voice(settings):
     service, bot, _ = make_dependencies(settings)
-    message = make_message(duration=25)
+    message = make_message(duration=10)
     await service.processed.complete([message])
     await service.handle(message, bot)
     service.transcriber.transcribe.assert_awaited_once()
