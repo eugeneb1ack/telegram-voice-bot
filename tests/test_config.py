@@ -2,9 +2,10 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 
-def test_default_conversation_window_is_seven_minutes(settings):
-    assert settings.context_ttl_seconds == 420
-    assert settings.context_series_gap_seconds == 420
+def test_default_window_and_summary_threshold(settings):
+    assert settings.summary_min_voice_seconds == 15
+    assert settings.context_ttl_seconds == 600
+    assert settings.context_series_gap_seconds == 600
 
 
 def test_one_openai_key_powers_both_stages(settings):

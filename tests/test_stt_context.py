@@ -65,8 +65,8 @@ async def test_ordinary_reply_thread_uses_zero_scope_and_real_topic_stays_separa
 @pytest.mark.parametrize(
     "seconds,number,included",
     [
-        (-421, 1, False),
-        (-420, 1, True),
+        (-601, 1, False),
+        (-600, 1, True),
         (0, 19, True),
         (0, 20, False),
         (0, 21, False),

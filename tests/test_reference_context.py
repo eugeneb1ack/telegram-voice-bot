@@ -11,12 +11,12 @@ from voice_bot.semantic_context import apply_links
 
 def story(*, source_time=926, first_time=1000, last_time=1327, second_person=False):
     mem = ConversationMemory(
-        420,
+        600,
         12000,
         200,
         lambda: last_time,
         max_entries=12,
-        series_gap=420,
+        series_gap=600,
         history_lookback=300,
     )
     key = (-100, 0, 1)
@@ -63,7 +63,7 @@ def test_person_reference_is_bound_to_its_voice_and_passed_as_grounded_backgroun
 
 @pytest.mark.parametrize("age,allowed", [(299, True), (300, True), (301, False)])
 def test_five_minutes_are_checked_before_each_voice_not_before_summary(age, allowed):
-    _, graph = story(source_time=1000 - age, last_time=1419)
+    _, graph = story(source_time=1000 - age, last_time=1250)
     assert bool(graph.candidates) is allowed
     selected = apply_links(graph, {"links": [person_link()]})
     assert bool(next(n for n in selected.messages if n.message_id == 10).references) is allowed
@@ -203,3 +203,15 @@ async def test_background_survives_restart_until_series_finishes_without_extendi
     assert restored.activity(key, 720).started_at == 720
     assert restored.activity(key, 720).voice_count == 0
     restored.clear()
+
+
+@pytest.mark.parametrize("age,allowed", [(599, True), (600, False), (1800, False)])
+def test_implicit_reference_cannot_cross_summary_window_even_if_near_first_voice(age, allowed):
+    # First voice can refer to a recent source, but by summary time it may be too old.
+    _, graph = story(source_time=800, first_time=1000, last_time=800 + age)
+    assert bool(graph.candidates) is allowed
+    # Validate again when applying links, even if a caller supplies a stale candidate.
+    _, fresh = story(source_time=800, first_time=1000, last_time=1250)
+    stale = replace(graph, candidates=fresh.candidates)
+    selected = apply_links(stale, {"links": [person_link()]})
+    assert bool(selected.branches[0].context_message_ids) is allowed

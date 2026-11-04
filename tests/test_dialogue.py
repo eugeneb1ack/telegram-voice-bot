@@ -448,3 +448,33 @@ async def test_legacy_separate_summary_watermark_does_not_repeat_an_old_triple(s
     assert "Старое" not in call.args[0]
     assert call.kwargs["context"].recent_summaries == ()
     await service.close()
+
+
+@pytest.mark.parametrize("old_count", [1, 2])
+@pytest.mark.parametrize("pause", [600, 1800])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_expired_series_never_contributes_to_new_triplet(settings, old_count, pause, restart):
+    service, bot, _ = setup(settings)
+    for mid in range(1, old_count + 1):
+        await voice(service, bot, mid, seconds=(mid - 1) * 20)
+    # Text keeps source storage alive, but cannot extend the voice series.
+    await text(service, 3, "Старая текстовая тема.", seconds=pause - 1)
+    if restart:
+        await service.close()
+        service, bot, _ = setup(settings)
+    for mid in (4, 5, 6):
+        message = await voice(service, bot, mid, seconds=pause + (mid - 4) * 10)
+        assert ("Коротко" in message.answer.await_args.args[0]) == (mid == 6)
+    context = service.summarizer.summarize.await_args.kwargs["context"]
+    assert [n.message_id for n in context.dialogue.messages] == [4, 5, 6]
+    assert all(n.message_id not in range(1, old_count + 1) for n in context.dialogue.candidates)
+    await service.close()
+
+
+async def test_last_voice_before_ten_minutes_still_completes_triplet(settings):
+    service, bot, _ = setup(settings)
+    for mid, seconds in [(1, 0), (2, 300), (3, 599)]:
+        message = await voice(service, bot, mid, seconds=seconds)
+    assert "Коротко · 3 голосовых:" in message.answer.await_args.args[0]
+    assert all(f"Мысль {i}." in service.summarizer.summarize.await_args.args[0] for i in (1, 2, 3))
+    await service.close()

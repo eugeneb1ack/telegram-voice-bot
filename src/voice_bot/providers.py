@@ -355,11 +355,6 @@ class HTTPSummarizer:
                 },
                 "dialogue": dialogue_payload(dialogue, settings.summary_max_input_chars),
             }
-            fields: dict[str, dict[str, Any]] = {
-                branch.branch_id: {"type": "string"} for branch in dialogue.branches
-            }
-            if dialogue.has_previous_summary:
-                fields = {"recap": {"type": "string", "maxLength": 240}, **fields}
             output_format = {
                 "text": {
                     "format": {
@@ -368,8 +363,8 @@ class HTTPSummarizer:
                         "strict": True,
                         "schema": {
                             "type": "object",
-                            "properties": fields,
-                            "required": list(fields),
+                            "properties": {"summary": {"type": "string"}},
+                            "required": ["summary"],
                             "additionalProperties": False,
                         },
                     }
@@ -406,46 +401,19 @@ class HTTPSummarizer:
         if dialogue is not None:
             try:
                 sections = json.loads(text)
-                expected = {branch.branch_id for branch in dialogue.branches}
-                if dialogue.has_previous_summary:
-                    expected.add("recap")
-                if not isinstance(sections, dict) or set(sections) != expected:
-                    raise ValueError
-                if any(not isinstance(value, str) for value in sections.values()):
+                if (
+                    not isinstance(sections, dict)
+                    or set(sections) != {"summary"}
+                    or not isinstance(sections["summary"], str)
+                    or not sections["summary"].strip()
+                ):
                     raise ValueError
             except (ValueError, TypeError):
-                raise ProviderError("Не удалось получить сводку по веткам диалога.") from None
-            author_name = " ".join((context.author_name or "").split()) if context else ""
-            author_username = (context.author_username or "").strip() if context else ""
-            author_label = author_name or (f"@{author_username}" if author_username else "Автор")
-            parts: list[str] = []
-            if recap := sections.get("recap", "").strip():
-                for prefix in ("ранее:", "ранее "):
-                    if recap.lower().startswith(prefix):
-                        recap = recap[len(prefix) :].lstrip()
-                        break
-                parts.append(f"Ранее: {recap}")
-            for branch in dialogue.branches:
-                body = sections[branch.branch_id].strip()
-                if not body:
-                    continue
-                if branch.is_reply:
-                    name = " ".join((branch.recipient_name or "").split())
-                    username = (branch.recipient_username or "").strip()
-                    label = name or (f"@{username}" if username else "собеседник")
-                    parts.append(f"• {author_label} → {label}:\n{body}")
-                elif len(dialogue.branches) > 1:
-                    parts.append(f"• {author_label}:\n{body}")
-                else:
-                    parts.append(body)
-            text = "\n\n".join(parts) or "В записях нет содержательных реплик для сводки."
-            if len(dialogue.branches) > 1 or any(b.is_reply for b in dialogue.branches):
-                return text
+                raise ProviderError("Не удалось получить целостную сводку диалога.") from None
+            return sections["summary"].strip()
         if context is not None and context.author_source != "multiple":
             name = " ".join((context.author_name or "").split())
             username = (context.author_username or "").strip()
             label = name or (f"@{username}" if username else "Автор")
-            if dialogue is not None and text.startswith(f"{label} "):
-                return text
-            return f"{label}:" + ("\n\n" if dialogue and len(dialogue.branches) > 1 else " ") + text
+            return f"{label}: {text}"
         return text

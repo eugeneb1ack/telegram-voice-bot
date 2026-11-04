@@ -47,7 +47,7 @@ async def test_own_speech_and_other_speaker_background_are_separate_on_wire(sett
         assert {m["author_id"] for m in b1["primary_messages"]} == {1}
         assert b1["background_messages"][0]["author_id"] == 2
         assert b1["background_messages"][0]["role"] == "other_speaker"
-        assert "recipient_name" not in b1  # addressee isn't a speaker instruction
+        assert b1["recipient"] == "Борис"  # recipient is data, not the speaking role
         assert not b2["background_messages"]
         assert [m["message_id"] for m in b2["primary_messages"]] == [12]
         assert "профессиональный" not in payload["input"]
@@ -55,8 +55,11 @@ async def test_own_speech_and_other_speaker_background_are_separate_on_wire(sett
         assert all("author_name" not in m for m in b1["primary_messages"])
         return response(
             {
-                "b1": "Любит слушать джаз. Играть не умеет, кроме одной мелодии одним пальцем.",
-                "b2": "Собирается попробовать её сыграть.",
+                "summary": (
+                    "Антон любит слушать джаз, но играть не умеет, "
+                    "кроме одной мелодии одним пальцем. "
+                    "Собирается попробовать её сыграть."
+                ),
             }
         )
 
@@ -65,8 +68,8 @@ async def test_own_speech_and_other_speaker_background_are_separate_on_wire(sett
             "Три записи", context=SummaryContext(author_name="Антон", dialogue=graph)
         )
     assert result == (
-        "• Антон → Борис:\nЛюбит слушать джаз. Играть не умеет, кроме одной мелодии одним пальцем."
-        "\n\n• Антон:\nСобирается попробовать её сыграть."
+        "Антон любит слушать джаз, но играть не умеет, кроме одной мелодии одним пальцем. "
+        "Собирается попробовать её сыграть."
     )
     assert len(calls) == 1  # no extra verifier/model round trip
 
@@ -128,7 +131,7 @@ async def test_speaker_display_name_reaches_model_without_duplicate_heading(
         payload = json.loads(request.content)
         assert json.loads(payload["input"])["context"]["speaker_name"] == label
         assert label not in payload["instructions"]
-        return response({"b2": body})
+        return response({"summary": body})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
         result = await HTTPSummarizer(APIClient(client, settings)).summarize(

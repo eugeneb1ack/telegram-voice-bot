@@ -30,7 +30,12 @@ def eligible_source(
     dialogue: SharedDialogue, current: DialogueMessage, source: DialogueMessage
 ) -> bool:
     explicit = any(source.message_id in b.context_message_ids for b in dialogue.branches)
-    return source.message_id < current.message_id and (within_lookback(current, source) or explicit)
+    within_window = dialogue.window_start is None or (
+        source.sent_at is not None and source.sent_at > dialogue.window_start
+    )
+    return source.message_id < current.message_id and (
+        (within_window and within_lookback(current, source)) or explicit
+    )
 
 
 def apply_links(dialogue: SharedDialogue, result: Any) -> SharedDialogue:
