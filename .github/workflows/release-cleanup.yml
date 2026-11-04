@@ -1,0 +1,43 @@
+name: Release cleanup
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Keep the latest two releases and tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import subprocess
+
+          repository = os.environ["GH_REPO"]
+          pages = json.loads(subprocess.check_output([
+              "gh", "api", "--paginate", "--slurp",
+              f"repos/{repository}/releases?per_page=100",
+          ], text=True))
+          releases = [release for page in pages for release in page if not release["draft"]]
+          releases.sort(key=lambda release: (release["published_at"], release["id"]), reverse=True)
+          for release in releases[2:]:
+              subprocess.run([
+                  "gh", "release", "delete", release["tag_name"],
+                  "--repo", repository, "--cleanup-tag", "--yes",
+              ], check=True)
+              print(f"Deleted release {release['tag_name']}")
+          PYTHON

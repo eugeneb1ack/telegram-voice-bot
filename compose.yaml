@@ -1,0 +1,29 @@
+services:
+  voice-bot:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      GROUP_STATE_FILE: /app/data/groups.json
+      QUEUE_STATE_FILE: /app/data/queue.sqlite3
+      PROCESSED_STATE_FILE: /app/data/processed.jsonl
+      PRIVATE_USAGE_FILE: /app/data/private-usage.json
+      CONTEXT_STATE_FILE: /app/data/conversations.json
+    volumes:
+      - group-state:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=${TMPFS_SIZE:-256m},mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: ${STOP_GRACE_PERIOD:-330s}
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "3"
+
+volumes:
+  group-state:
