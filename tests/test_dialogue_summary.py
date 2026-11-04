@@ -8,7 +8,7 @@ from test_semantic_context import response
 from voice_bot.dialogue_graph import DialogueBranch, DialogueMessage, SharedDialogue
 from voice_bot.dialogue_summary import dialogue_payload
 from voice_bot.errors import ProviderError
-from voice_bot.providers import APIClient, HTTPSummarizer, SummaryContext
+from voice_bot.providers import APIClient, HTTPSummarizer, SummaryContext, summary_length_hint
 
 
 def music_dialogue():
@@ -37,6 +37,8 @@ async def test_own_speech_and_other_speaker_background_are_separate_on_wire(sett
     def respond(request):
         payload = json.loads(request.content)
         calls.append(payload)
+        assert "пунктов" not in payload["instructions"]
+        assert "по веткам" not in payload["instructions"]
         data = json.loads(payload["input"])["dialogue"]
         assert "branches" not in data
         primary = data["primary_messages"]
@@ -192,3 +194,40 @@ def test_missing_forward_or_cyclic_reply_does_not_invent_a_recipient():
         ),
     )
     assert all(m["reply_to"] is None for m in dialogue_payload(graph, 10000)["primary_messages"])
+
+
+def test_named_third_person_is_never_promoted_to_message_speaker():
+    graph = music_dialogue()
+    graph = replace(
+        graph,
+        messages=tuple(
+            replace(
+                m,
+                author_name="🐗 💋",
+                kind="video_note",
+                text="Борис попросил меня забрать Веру. Что ей привезти?",
+            )
+            if m.message_id == 1
+            else m
+            for m in graph.messages
+        ),
+    )
+    primary = dialogue_payload(graph, 10000)["primary_messages"][0]
+    assert primary["speaker"] == {"id": 1, "name": "Антон"}
+    assert primary["reply_to"]["speaker"] == {"id": 2, "name": "🐗 💋"}
+    assert primary["reply_recipient"] == {"id": 2, "name": "🐗 💋"}
+    assert "Борис" in primary["reply_to"]["text"]
+
+
+def test_length_hint_ignores_recipient_grouping_and_unselected_history(settings):
+    graph = music_dialogue()
+    baseline = summary_length_hint("", SummaryContext(dialogue=graph), settings)
+    changed = replace(
+        graph,
+        branches=(DialogueBranch("b1", None, None, None, (10, 11, 12)),),
+        messages=tuple(
+            replace(m, text="Лишняя история " * 1000) if m.message_id == 2 else m
+            for m in graph.messages
+        ),
+    )
+    assert summary_length_hint("", SummaryContext(dialogue=changed), settings) == baseline

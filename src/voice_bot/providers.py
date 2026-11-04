@@ -56,7 +56,27 @@ class Summarizer(Protocol):
 
 def summary_length_hint(transcript: str, context: SummaryContext | None, settings: Settings) -> str:
     words = len(transcript.split())
-    if context and context.reply_contexts:
+    if context and context.dialogue:
+        primary_ids = {mid for b in context.dialogue.branches for mid in b.message_ids}
+        words = sum(
+            len(m.text.split()) for m in context.dialogue.messages if m.message_id in primary_ids
+        )
+        # A short answer can need names/details from its source to be intelligible.
+        # Budget that clarification once, without inviting a recap of all history.
+        source_ids = {
+            mid
+            for m in context.dialogue.messages
+            if m.message_id in primary_ids
+            for mid in (m.reply_to_message_id, *m.context_message_ids)
+            if mid is not None and mid not in primary_ids
+        }
+        words += min(
+            80,
+            sum(
+                len(m.text.split()) for m in context.dialogue.messages if m.message_id in source_ids
+            ),
+        )
+    elif context and context.reply_contexts:
         words += min(80, sum(len(item.text.split()) for item in context.reply_contexts))
     multiple_topics = (
         context is not None
@@ -78,12 +98,6 @@ def summary_length_hint(transcript: str, context: SummaryContext | None, setting
     # A short source must not expand to fill a larger configured word target.
     upper = min(target, max(1, words * 3 // 4))
     lower = max(1, int(upper * lower_ratio))
-    if context and context.dialogue and len(context.dialogue.branches) > 1:
-        form = f"{len(context.dialogue.branches)} отдельных коротких пунктов по веткам диалога"
-        upper = max(
-            upper, min(settings.summary_long_target_words, len(context.dialogue.branches) * 25)
-        )
-        lower = max(1, upper * 2 // 3)
     return (
         f"{form}, ориентир — {lower}–{upper} слов, включая имя автора. "
         "Сокращай за счёт повторов и вводных слов, "
