@@ -54,11 +54,12 @@ def test_person_reference_is_bound_to_its_voice_and_passed_as_grounded_backgroun
     _, graph = story()
     selected = apply_links(graph, {"links": [person_link()]})
     payload = dialogue_payload(selected, 10000)
-    first, second, third = payload["branches"][0]["primary_messages"]
-    assert first["references"] == ({"source_id": 1, "mention": "Он", "referent": "Марк"},)
+    first, second, third = payload["primary_messages"]
+    assert first["references"] == [{"source_id": 1, "mention": "Он", "referent": "Марк"}]
     assert not second["references"] and not third["references"]
     assert first["text"].startswith("Он недавно")  # no rewriting the transcript
-    assert payload["branches"][0]["background_messages"][0]["role"] == "same_speaker"
+    assert first["background"][0]["speaker"]["id"] == 1
+    assert not second["background"] and not third["background"]
 
 
 @pytest.mark.parametrize("age,allowed", [(299, True), (300, True), (301, False)])
@@ -130,7 +131,7 @@ def test_only_leading_person_can_inherit_an_old_name(text, expected):
 
 def test_unknown_opening_person_is_never_marked_as_the_speaker():
     _, graph = story()
-    primary = dialogue_payload(graph, 10000)["branches"][0]["primary_messages"]
+    primary = dialogue_payload(graph, 10000)["primary_messages"]
     assert primary[0]["unresolved_reference"] == "Он"
     assert not primary[1]["unresolved_reference"]
 
@@ -143,6 +144,7 @@ def test_known_object_reference_is_not_marked_as_an_unknown_person(direct_reply)
         graph.messages[0],
         text="Он лёгкий и удобный.",
         reply_to_message_id=source.message_id if direct_reply else None,
+        context_message_ids=() if direct_reply else (source.message_id,),
     )
     graph = replace(
         graph,
@@ -151,9 +153,10 @@ def test_known_object_reference_is_not_marked_as_an_unknown_person(direct_reply)
             replace(b, context_message_ids=(source.message_id,)) for b in graph.branches
         ),
     )
-    branch = dialogue_payload(graph, 10000)["branches"][0]
-    assert branch["primary_messages"][0]["unresolved_reference"] is None
-    assert branch["background_messages"][0]["text"] == "Купил новый велосипед."
+    primary = dialogue_payload(graph, 10000)["primary_messages"][0]
+    assert primary["unresolved_reference"] is None
+    source = primary["reply_to"] if direct_reply else primary["background"][0]
+    assert source["text"] == "Купил новый велосипед."
 
 
 def test_person_in_a_later_new_topic_cannot_inherit_the_old_name():

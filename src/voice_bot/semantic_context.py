@@ -139,8 +139,12 @@ def apply_links(dialogue: SharedDialogue, result: Any) -> SharedDialogue:
     nodes = {n.message_id: n for n in dialogue.messages}
     for mid in selected:
         nodes.setdefault(mid, candidates[mid])
-    for mid, refs in references.items():
-        nodes[mid] = replace(nodes[mid], references=tuple(refs))
+    for mid, source_ids in by_message.items():
+        nodes[mid] = replace(
+            nodes[mid],
+            references=tuple(references.get(mid, ())),
+            context_message_ids=tuple(sorted(source_ids)),
+        )
     return replace(
         clean, messages=tuple(sorted(nodes.values(), key=lambda n: n.message_id)), branches=branches
     )

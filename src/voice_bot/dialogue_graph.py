@@ -40,6 +40,8 @@ class DialogueMessage:
     unavailable_reason: str | None = None
     sent_at: float | None = None
     references: tuple[ResolvedReference, ...] = ()
+    # Semantic background belongs to this utterance, never to all its siblings.
+    context_message_ids: tuple[int, ...] = ()
 
 
 def within_lookback(current: DialogueMessage, source: DialogueMessage) -> bool:

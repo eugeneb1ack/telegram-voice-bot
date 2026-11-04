@@ -328,7 +328,13 @@ async def test_structured_summary_is_one_narrative_with_grounded_recipients(
         assert schema["additionalProperties"] is False
         data = json.loads(payload["input"])
         assert data["dialogue"]["focus_author_id"] == 1
-        assert [b["recipient"] for b in data["dialogue"]["branches"]] == ["Анна", "Анна", None]
+        primary = data["dialogue"]["primary_messages"]
+        assert [m["reply_to"]["speaker"]["id"] if m["reply_to"] else None for m in primary] == [
+            2,
+            3,
+            None,
+            2,
+        ]
         answer = {"summary": body} if invalid is None else invalid
         return httpx.Response(
             200,

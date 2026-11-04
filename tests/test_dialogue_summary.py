@@ -38,21 +38,14 @@ async def test_own_speech_and_other_speaker_background_are_separate_on_wire(sett
         payload = json.loads(request.content)
         calls.append(payload)
         data = json.loads(payload["input"])["dialogue"]
-        assert "messages" not in data
-        b1, b2 = data["branches"]
-        assert [m["text"] for m in b1["primary_messages"]] == [
-            "Люблю слушать джаз.",
-            "Играть не умею, только одну мелодию пальцем.",
-        ]
-        assert {m["author_id"] for m in b1["primary_messages"]} == {1}
-        assert b1["background_messages"][0]["author_id"] == 2
-        assert b1["background_messages"][0]["role"] == "other_speaker"
-        assert b1["recipient"] == "Борис"  # recipient is data, not the speaking role
-        assert not b2["background_messages"]
-        assert [m["message_id"] for m in b2["primary_messages"]] == [12]
+        assert "branches" not in data
+        primary = data["primary_messages"]
+        assert [m["message_id"] for m in primary] == [10, 11, 12]
+        assert primary[0]["reply_to"]["speaker"] == {"id": 2, "name": "Борис"}
+        assert primary[1]["reply_to"]["text"] == "Я играю джаз. А ты играешь?"
+        assert primary[2]["reply_to"] is None and not primary[2]["background"]
         assert "профессиональный" not in payload["input"]
         assert json.loads(payload["input"])["context"]["speaker_name"] == "Антон"
-        assert all("author_name" not in m for m in b1["primary_messages"])
         return response(
             {
                 "summary": (
@@ -84,18 +77,12 @@ def test_foreign_missing_or_duplicate_primary_cannot_reach_model(ids):
         dialogue_payload(graph, 10000)
 
 
-def test_background_shared_by_branches_counts_towards_request_limit():
+def test_repeated_reply_text_counts_towards_request_limit():
     graph = music_dialogue()
-    graph = replace(
-        graph,
-        branches=(graph.branches[0], replace(graph.branches[1], context_message_ids=(1,))),
-    )
     payload = dialogue_payload(graph, 10000)
     total = sum(
-        len(m["text"])
-        for b in payload["branches"]
-        for field in ("primary_messages", "background_messages")
-        for m in b[field]
+        len(m["text"]) + (len(m["reply_to"]["text"]) if m["reply_to"] else 0)
+        for m in payload["primary_messages"]
     )
     dialogue_payload(graph, total)
     with pytest.raises(ProviderError, match="длинный"):
@@ -107,8 +94,8 @@ def test_unknown_background_author_never_becomes_same_speaker():
     graph = replace(
         graph, messages=(replace(graph.messages[0], author_id=None), *graph.messages[1:])
     )
-    assert dialogue_payload(graph, 10000)["branches"][0]["background_messages"][0]["role"] == (
-        "other_speaker"
+    assert (
+        dialogue_payload(graph, 10000)["primary_messages"][0]["reply_to"]["speaker"]["id"] is None
     )
 
 
@@ -139,3 +126,69 @@ async def test_speaker_display_name_reaches_model_without_duplicate_heading(
             context=SummaryContext(author_name=name, author_username=username, dialogue=graph),
         )
     assert result == body
+
+
+def test_interleaved_recipients_are_chronological_and_each_reply_keeps_its_own_source():
+    graph = music_dialogue()
+    messages = list(graph.messages)
+    messages[3] = replace(messages[3], reply_to_message_id=2)
+    messages[4] = replace(messages[4], reply_to_message_id=1)
+    graph = replace(
+        graph,
+        messages=tuple(messages),
+        branches=(
+            DialogueBranch("b1", 2, "Борис", None, (10, 12), True, (1,)),
+            DialogueBranch("b2", 3, "Вера", None, (11,), True, (2,)),
+        ),
+    )
+    primary = dialogue_payload(graph, 10000)["primary_messages"]
+    assert [m["message_id"] for m in primary] == [10, 11, 12]
+    assert [m["reply_to"]["speaker"]["id"] for m in primary] == [2, 3, 2]
+    assert "профессиональный" not in json.dumps(primary[0], ensure_ascii=False)
+    assert "профессиональный" in primary[1]["reply_to"]["text"]
+
+
+def test_reply_to_own_message_keeps_literal_speaker_and_nested_recipient():
+    graph = music_dialogue()
+    graph = replace(
+        graph,
+        messages=tuple(
+            replace(m, reply_to_message_id=10) if m.message_id == 11 else m for m in graph.messages
+        ),
+    )
+    primary = dialogue_payload(graph, 10000)["primary_messages"]
+    reply = primary[1]["reply_to"]
+    assert reply["speaker"] == {"id": 1, "name": "Антон"}
+    assert reply["reply_to"]["speaker"] == {"id": 2, "name": "Борис"}
+    assert primary[2]["reply_to"] is None  # no inherited recipient without evidence
+
+
+def test_branch_background_cannot_leak_into_unlinked_siblings():
+    graph = music_dialogue()
+    graph = replace(
+        graph,
+        branches=(DialogueBranch("b1", None, None, None, (10, 11, 12), False, (1, 2)),),
+        messages=tuple(
+            replace(m, reply_to_message_id=None, context_message_ids=(2,))
+            if m.message_id == 11
+            else m
+            for m in graph.messages
+        ),
+    )
+    primary = dialogue_payload(graph, 10000)["primary_messages"]
+    assert primary[0]["reply_to"]["speaker"]["id"] == 2
+    assert not primary[0]["background"]
+    assert primary[1]["background"][0]["speaker"]["id"] == 3
+    assert not primary[2]["background"] and primary[2]["reply_to"] is None
+
+
+def test_missing_forward_or_cyclic_reply_does_not_invent_a_recipient():
+    graph = music_dialogue()
+    graph = replace(
+        graph,
+        messages=tuple(
+            replace(m, reply_to_message_id=m.message_id + 1) if m.message_id >= 10 else m
+            for m in graph.messages
+        ),
+    )
+    assert all(m["reply_to"] is None for m in dialogue_payload(graph, 10000)["primary_messages"])
