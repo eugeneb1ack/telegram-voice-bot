@@ -95,7 +95,8 @@ async def test_reply_ids_survive_restart_and_legacy_receipts_can_be_upgraded(tmp
     assert store.reply_ids(voice()) == ()
     await store.complete([voice()], (101, 102))
     reloaded = ProcessedVoices(path)
-    assert reloaded.reply_ids(voice(index=2)) == (101, 102)
+    assert reloaded.reply_ids(voice()) == (101, 102)
+    assert reloaded.reply_ids(voice(index=2)) == ()
     assert reloaded.claim(voice(index=2), completed_ok=True)
     assert "same-audio" not in path.read_text()
     assert json.loads(path.read_text().splitlines()[-1])["replies"] == [101, 102]
@@ -106,7 +107,8 @@ async def test_newest_reply_pointer_remains_valid_when_older_receipt_is_evicted(
     await store.complete([voice(1)], (101,))
     await store.complete([voice(2)], (102,))
     await store.complete([voice(3, unique="another")], (103,))
-    assert store.reply_ids(voice(4)) == (102,)
+    assert store.reply_ids(voice(2)) == (102,)
+    assert store.reply_ids(voice(4)) == ()
 
 
 @pytest.mark.parametrize("content", ["broken", '["raw-message-id"]\n', "{}\n", "[]\n"])

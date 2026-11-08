@@ -5,7 +5,7 @@
 Telegram bot that transcribes voice messages using OpenAI.
 
 - Full transcripts in expandable quotes, with a typing indicator during processing.
-- Summaries for recordings of at least 15 seconds, or each group of three shorter recordings with its own 10-minute window.
+- Summaries for recordings of at least 15 seconds, or each group of three shorter recordings with its own 7-minute window.
 - Summaries use only the current voice recordings; separate counters per user, chat and topic.
 - Text, captions, video notes and earlier voice blocks are excluded. Reply recipient names are preserved.
 - Automatic processing or quiet mode with private `/text` replies.

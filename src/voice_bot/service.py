@@ -735,7 +735,7 @@ class VoiceService:
             for entry in session.entries
             if entry.kind == "voice"
             and entry.summary is None
-            and max(entry.message_ids) > session.summarized_through
+            and max(entry.message_ids) > max(session.summarized_through, session.claimed_through)
             and series.started_at <= entry.sent_at <= sent_at
             and (entry.sent_at, max(entry.message_ids)) < (sent_at, message.message_id)
         ][-min(3, pending) :]

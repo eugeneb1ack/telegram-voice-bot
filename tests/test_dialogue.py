@@ -452,7 +452,7 @@ async def test_legacy_separate_summary_watermark_does_not_repeat_an_old_triple(s
 
 
 @pytest.mark.parametrize("old_count", [1, 2])
-@pytest.mark.parametrize("pause", [600, 1800])
+@pytest.mark.parametrize("pause", [420, 600, 1800, 3600])
 @pytest.mark.parametrize("restart", [False, True])
 async def test_expired_series_never_contributes_to_new_triplet(settings, old_count, pause, restart):
     service, bot, _ = setup(settings)
@@ -471,9 +471,9 @@ async def test_expired_series_never_contributes_to_new_triplet(settings, old_cou
     await service.close()
 
 
-async def test_last_voice_before_ten_minutes_still_completes_triplet(settings):
+async def test_last_voice_before_seven_minutes_still_completes_triplet(settings):
     service, bot, _ = setup(settings)
-    for mid, seconds in [(1, 0), (2, 300), (3, 599)]:
+    for mid, seconds in [(1, 0), (2, 200), (3, 419)]:
         message = await voice(service, bot, mid, seconds=seconds)
     assert "Коротко · 3 голосовых:" in message.answer.await_args.args[0]
     assert all(f"Мысль {i}." in service.summarizer.summarize.await_args.args[0] for i in (1, 2, 3))
@@ -482,7 +482,7 @@ async def test_last_voice_before_ten_minutes_still_completes_triplet(settings):
 
 @pytest.mark.parametrize("restart", [0, 3, 5])
 @pytest.mark.parametrize("first_block", ["triplet", "long", "failed"])
-async def test_next_block_gets_its_own_ten_minutes(settings, restart, first_block):
+async def test_next_block_gets_its_own_seven_minutes(settings, restart, first_block):
     service, bot, _ = setup(settings)
     if first_block == "failed":
         service.summarizer.summarize.side_effect = TimeoutError()
@@ -626,4 +626,44 @@ async def test_old_failed_block_stays_closed_across_two_restarts(settings):
     for mid in (4, 5, 6):
         await voice(service, bot, mid)
         assert service.summarizer.summarize.await_count == int(mid == 6)
+    await service.close()
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_reposted_voice_never_replays_a_previous_triplet(settings, restart):
+    service, bot, _ = setup(settings)
+    for mid in (1, 2, 3):
+        original = identified_message(mid, seconds=mid * 10, duration=10)
+        original.voice.file_unique_id = f"recording-{mid}"
+        service.transcriber.transcribe.return_value = f"Мысль {mid}."
+        await service.handle(original, bot)
+    if restart:
+        await service.close()
+        service, bot, _ = setup(settings)
+    duplicate = identified_message(4, seconds=3600, duration=10)
+    duplicate.voice.file_unique_id = original.voice.file_unique_id
+    service.transcriber.transcribe.return_value = "Повторённая запись."
+    await service.handle(duplicate, bot)
+    bot.copy_message.assert_not_awaited()
+    assert "Коротко" not in duplicate.answer.await_args.args[0]
+    for mid in (5, 6):
+        await voice(service, bot, mid, seconds=3600 + mid)
+    graph = service.summarizer.summarize.await_args.kwargs["context"].dialogue
+    assert graph.branches[0].message_ids == (4, 5, 6)
+    await service.close()
+
+
+async def test_upgrade_to_seven_minutes_drops_older_pending_voices(settings):
+    settings.context_ttl_seconds = settings.context_series_gap_seconds = 600
+    service, bot, _ = setup(settings)
+    await voice(service, bot, 1, seconds=0)
+    await voice(service, bot, 2, seconds=100)
+    await service.close()
+    settings.context_ttl_seconds = settings.context_series_gap_seconds = 420
+    service, bot, _ = setup(settings)
+    for mid in (3, 4, 5):
+        message = await voice(service, bot, mid, seconds=450 + (mid - 3) * 10)
+        assert ("Коротко" in message.answer.await_args.args[0]) == (mid == 5)
+    graph = service.summarizer.summarize.await_args.kwargs["context"].dialogue
+    assert graph.branches[0].message_ids == (3, 4, 5)
     await service.close()

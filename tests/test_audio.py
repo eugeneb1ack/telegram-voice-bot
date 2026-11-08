@@ -1,6 +1,8 @@
 import asyncio
+import math
 import shutil
 import wave
+from array import array
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -77,3 +79,43 @@ async def test_ffmpeg_timeout_kills_and_reaps_process(tmp_path, monkeypatch):
         )
     process.kill.assert_called_once()
     assert process.wait.await_count == 2
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="optional local FFmpeg smoke test")
+async def test_ogg_opus_conversion_preserves_first_and_last_audio_samples(tmp_path):
+    source, encoded, destination = (
+        tmp_path / name for name in ("source.wav", "voice.ogg", "out.wav")
+    )
+    rate = 48000
+    # Speech can start immediately; neither edge may be discarded by decoding.
+    samples = array(
+        "h",
+        (
+            int(12000 * math.sin(2 * math.pi * 700 * i / rate))
+            if i < rate // 5 or i >= rate * 2 - rate // 5
+            else 0
+            for i in range(rate * 2)
+        ),
+    )
+    with wave.open(str(source), "wb") as audio:
+        audio.setparams((1, 2, rate, 0, "NONE", "not compressed"))
+        audio.writeframes(samples.tobytes())
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source),
+        "-c:a",
+        "libopus",
+        str(encoded),
+    )
+    assert await asyncio.wait_for(process.wait(), 10) == 0
+    await convert_audio(encoded, destination, binary="ffmpeg", max_bytes=200000, timeout_seconds=5)
+    with wave.open(str(destination), "rb") as audio:
+        assert audio.getnframes() == 32000
+        decoded = array("h", audio.readframes(audio.getnframes()))
+    for edge in (decoded[:320], decoded[-320:]):
+        assert sum(abs(sample) for sample in edge) / len(edge) > 5000
+    assert max(abs(sample) for sample in decoded[15000:16000]) < 100

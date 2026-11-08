@@ -113,10 +113,10 @@ class ProcessedVoices:
             self.receipts[key] = receipt
 
     def reply_ids(self, message: Message) -> tuple[int, ...]:
-        for key in reversed(voice_keys(message)):
-            if receipt := self.receipts.get(key):
-                return receipt.replies
-        return ()
+        # A file can be reposted by another author or in another voice block.
+        # Only the exact source message owns its complete Telegram reply.
+        receipt = self.receipts.get(voice_keys(message)[0])
+        return receipt.replies if receipt is not None else ()
 
     def claim(self, message: Message, *, completed_ok: bool = False) -> bool:
         if not self.available or not message.voice:
