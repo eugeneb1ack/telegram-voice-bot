@@ -80,7 +80,7 @@ class DialogueContext:
         previous = [
             e
             for e in session.entries
-            if 0 <= sent_at - e.sent_at <= self.memory.ttl
+            if 0 <= sent_at - e.sent_at < self.memory.ttl
             and (e.sent_at, max(e.message_ids)) < (sent_at, message_id)
         ]
         entries = previous + [
@@ -92,10 +92,16 @@ class DialogueContext:
             for e in entries
             if e.kind == "voice"
             and e.summary is None
-            and max(e.message_ids) > session.summarized_through
+            and max(e.message_ids) > max(session.summarized_through, session.claimed_through)
             and e.sent_at >= series.started_at
         ][-new_count:]
         sources = voices
+        logger.info(
+            "voice_summary_block chat_id=%s topic_id=%s author_id=%s source_ids=%s span_seconds=%s",
+            *key,
+            ",".join(str(mid) for entry in voices for mid in entry.message_ids),
+            round(sent_at - voices[0].sent_at) if voices else 0,
+        )
         partial = len(voices) < new_count or any(e.text.endswith("…") for e in sources)
         references = bounded_contexts(
             tuple(context for entry in sources for context in entry.reply_contexts),

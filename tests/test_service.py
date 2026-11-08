@@ -1295,7 +1295,7 @@ async def test_private_quota_write_failure_never_reaches_download(settings, monk
     assert not service.processed.pending
 
 
-async def test_repeated_forward_copies_complete_telegram_reply_without_api(settings):
+async def test_reposted_file_reuses_transcript_but_not_the_previous_summary(settings):
     service, bot, _ = make_dependencies(settings)
     first = identified_message(1)
     first.voice.file_unique_id = "recording"
@@ -1305,14 +1305,9 @@ async def test_repeated_forward_copies_complete_telegram_reply_without_api(setti
     await service.handle(duplicate, bot)
     bot.get_file.assert_awaited_once()
     service.transcriber.transcribe.assert_awaited_once()
-    service.summarizer.summarize.assert_awaited_once()
-    bot.copy_message.assert_awaited_once()
-    call = bot.copy_message.await_args.kwargs
-    assert call["from_chat_id"] == call["chat_id"] == 123
-    assert call["message_id"] == 1000
-    assert call["reply_parameters"].message_id == 2
-    duplicate.answer.assert_not_awaited()
-    assert service.processed.reply_ids(duplicate) == (2000,)
+    assert service.summarizer.summarize.await_count == 2
+    bot.copy_message.assert_not_awaited()
+    duplicate.answer.assert_awaited_once()
 
 
 async def test_deleted_cached_reply_falls_back_to_processing(settings):
