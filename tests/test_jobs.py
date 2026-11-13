@@ -2,7 +2,7 @@ import asyncio
 from collections import defaultdict
 from types import SimpleNamespace
 
-from voice_bot.jobs import VoiceJobQueue
+from voice_bot.jobs import DeferredJob, VoiceJobQueue
 
 
 def message(chat, number):
@@ -105,4 +105,46 @@ async def test_shutdown_deadline_cancels_worker_and_releases_pending_messages():
     assert cancelled.is_set()
     assert not queue.workers and not queue.pending and not queue.active_chats
     assert queue.size == 0
+    await queue.close(grace_seconds=0)
+
+
+async def test_deferred_head_releases_worker_but_preserves_chat_order_and_capacity():
+    events = []
+    attempts = 0
+
+    async def handle(messages, bot):
+        nonlocal attempts
+        item = messages[0]
+        if (item.chat.id, item.message_id) == (1, 1):
+            attempts += 1
+            if attempts <= 3:
+                events.append("deferred")
+                raise DeferredJob(0.01)
+        events.append((item.chat.id, item.message_id))
+        assert queue.size + len(queue.active_chats) <= queue.max_pending + queue.concurrency
+
+    queue = VoiceJobQueue(handle, concurrency=1, max_pending=3, max_per_chat=2)
+    assert queue.add([message(1, 1)], None)
+    assert queue.add([message(1, 2)], None)
+    assert queue.add([message(2, 1)], None)
+    await queue.close(grace_seconds=2)
+    assert events == ["deferred", (2, 1), "deferred", "deferred", (1, 1), (1, 2)]
+    assert queue.size == 0 and not queue.pending and not queue.active_chats
+
+
+async def test_new_chat_wakes_worker_waiting_for_a_deferred_deadline():
+    deferred, completed = asyncio.Event(), asyncio.Event()
+
+    async def handle(messages, bot):
+        if messages[0].chat.id == 1:
+            deferred.set()
+            raise DeferredJob(60)
+        completed.set()
+
+    queue = VoiceJobQueue(handle, concurrency=1, max_pending=2, max_per_chat=2)
+    assert queue.add([message(1, 1)], None)
+    await asyncio.wait_for(deferred.wait(), 1)
+    assert queue.add([message(2, 1)], None)
+    await asyncio.wait_for(completed.wait(), 1)
+    assert queue.size == 1
     await queue.close(grace_seconds=0)

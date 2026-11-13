@@ -153,6 +153,58 @@ async def test_private_delivery_rejection_never_retries_publicly(settings, tmp_p
     assert "SECRET" not in caplog.text
 
 
+async def test_quiet_mode_stops_remaining_replayed_parts(settings, tmp_path):
+    service, bot, _ = make_dependencies(settings)
+    store = approved_group(service, tmp_path)
+    message = identified_message(42)
+    message.chat = SimpleNamespace(id=-100, type="supergroup", title="Test")
+    await service.processed.complete([message], (777, 778))
+
+    async def copied(**kwargs):
+        group = store.groups[-100]
+        store.set_mode(-100, group.revision, "quiet")
+        return SimpleNamespace(message_id=1000)
+
+    bot.copy_message = AsyncMock(side_effect=copied)
+    await service.handle(message, bot)
+    bot.copy_message.assert_awaited_once()
+    assert bot.copy_message.await_args.kwargs["message_id"] == 777
+    service.transcriber.transcribe.assert_not_awaited()
+    await service.close()
+
+
+@pytest.mark.parametrize("kind", ["text", "rich", "copy"])
+async def test_quiet_mode_is_rechecked_after_flood_wait(settings, tmp_path, kind):
+    service, bot, _ = make_dependencies(settings)
+    store = approved_group(service, tmp_path)
+    messages = [identified_message(42)]
+    if kind == "rich":
+        messages.append(identified_message(43))
+    for item in messages:
+        item.chat = SimpleNamespace(id=-100, type="supergroup", title="Test")
+    if kind == "copy":
+        await service.processed.complete(messages, (777,))
+
+    async def rejected(*args, **kwargs):
+        group = store.groups[-100]
+        store.set_mode(-100, group.revision, "quiet")
+        raise TelegramRetryAfter(
+            method=SendMessage(chat_id=-100, text="hidden"), message="SECRET", retry_after=0
+        )
+
+    sender = AsyncMock(side_effect=rejected)
+    if kind == "rich":
+        bot.send_rich_message = sender
+    elif kind == "copy":
+        bot.copy_message = sender
+    else:
+        messages[0].answer = sender
+    await service._handle_messages(messages, bot)
+    sender.assert_awaited_once()
+    assert not service.processed.pending
+    await service.close()
+
+
 async def test_private_errors_for_different_readers_are_not_suppressed(settings):
     service, _, _ = make_dependencies(settings)
     for user_id in (111, 222):

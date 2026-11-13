@@ -285,6 +285,33 @@ class QueueJournal:
         self.set(job_id, "deliveries", deliveries)
 
     @durable
+    def defer_delivery(
+        self, job_id: str, delay: float, *, window: float, max_retries: int = 3
+    ) -> float | None:
+        """Persist a bounded retry of a definitively rejected, already prepared reply."""
+        row = self.get(job_id)
+        if row["result"] is None or row["state"] == "uncertain":
+            raise ValueError("Only a prepared, definitely rejected reply can be deferred")
+        now = time.time()
+        cache = row["cache"]
+        previous = cache.get("delivery_retry", {})
+        count = previous.get("count", 0)
+        deadline = previous.get("deadline", now + window)
+        if count >= max_retries or now + delay >= deadline:
+            return None
+        cache["delivery_retry"] = {
+            "count": count + 1,
+            "not_before": now + delay,
+            "deadline": deadline,
+        }
+        with self.transaction():
+            self.db.execute(
+                "UPDATE jobs SET cache=?, state='retry_wait' WHERE id=?",
+                (json.dumps(cache), job_id),
+            )
+        return delay
+
+    @durable
     def finish(self, job_id: str) -> None:
         with self.transaction():
             self.db.execute("UPDATE requests SET job_id=NULL WHERE job_id=?", (job_id,))

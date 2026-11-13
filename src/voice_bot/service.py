@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.types import (
     LinkPreviewOptions,
     Message,
@@ -36,7 +41,7 @@ from voice_bot.dialogue import DialogueContext, DialogueInput
 from voice_bot.dialogue_graph import shared_dialogue
 from voice_bot.dialogue_summary import has_summary_content
 from voice_bot.errors import NoSpeechError, ProviderError, RecognitionError, UserFacingError
-from voice_bot.jobs import VoiceJobQueue
+from voice_bot.jobs import DeferredJob, VoiceJobQueue
 from voice_bot.journal import DeliveryUncertain, QueueJournal, request_key
 from voice_bot.limits import NoticeLimiter, SenderKey, sender_key
 from voice_bot.progress import typing
@@ -55,6 +60,10 @@ from voice_bot.stt_context import vocabulary
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
 Converter = Callable[..., Awaitable[None]]
+
+
+class DeliveryStopped(Exception):
+    """Delivery is no longer permitted before a Telegram send begins."""
 
 
 def summary_context(message: Message) -> SummaryContext:
@@ -244,8 +253,13 @@ class VoiceService:
             if state == "collecting" and len(messages) == 1:
                 if not self.batcher.add(messages[0], bot):
                     raise RuntimeError("Cannot restore forwarded voice buffer")
-            elif not self.queue.add(messages, bot, restoring=True):
-                raise RuntimeError("Cannot restore voice queue")
+            else:
+                retry = self.journal.get(job_id)["cache"].get("delivery_retry", {})
+                delay = max(
+                    0, min(retry.get("not_before", 0), retry.get("deadline", 0)) - time.time()
+                )
+                if not self.queue.add(messages, bot, restoring=True, delay=delay):
+                    raise RuntimeError("Cannot restore voice queue")
             restored += len(messages)
         await self.memory.checkpoint()
         logger.info("voice_queue_recovered voices=%s", restored)
@@ -267,17 +281,30 @@ class VoiceService:
         self.results.put(key, value)
 
     async def _deliver(
-        self, part: str, action: Callable[[], Awaitable[T]], identify: Callable[[T], int | None]
+        self,
+        message: Message,
+        part: str,
+        action: Callable[[], Awaitable[T]],
+        identify: Callable[[T], int | None],
     ) -> T | int:
+        if not self.work_allowed(message):
+            # Check before begin_send: nothing was transmitted, so this is not uncertain.
+            raise DeliveryStopped
         journal, job_id = self.journal, self._durable_job.get()
         if journal is None or job_id is None:
             return await action()
+        retry = journal.get(job_id)["cache"].get("delivery_retry")
+        if retry is not None and time.time() >= retry["deadline"]:
+            # The persisted window also bounds new parts of a multipart retry.
+            # An already started request retains its normal transport timeout.
+            logger.warning("voice_delivery_retry_exhausted job_id=%s", job_id)
+            raise DeliveryStopped
         known = journal.begin_send(job_id, part)
         if known is not None:
             return known
         try:
             result = await action()
-        except (TelegramBadRequest, TelegramRetryAfter):
+        except (TelegramBadRequest, TelegramRetryAfter, TelegramForbiddenError):
             journal.rejected(job_id, part)
             raise
         except BaseException:
@@ -340,6 +367,7 @@ class VoiceService:
                     )
 
                 sent = await self._deliver(
+                    message,
                     self._delivery_part.get()
                     or "text:" + hashlib.sha256(text.encode()).hexdigest(),
                     transmit,
@@ -365,6 +393,8 @@ class VoiceService:
                     else None
                 )
             except TelegramRetryAfter as exc:
+                if self.journal is not None and self._durable_job.get() is not None:
+                    raise
                 if attempt or exc.retry_after > self.settings.telegram_max_retry_after_seconds:
                     raise
                 await asyncio.sleep(exc.retry_after)
@@ -607,6 +637,7 @@ class VoiceService:
         message = messages[-1]
         started = time.monotonic()
         admitted = False
+        deferred = False
         completed: list[Message] = []
         task = asyncio.current_task()
         try:
@@ -642,6 +673,11 @@ class VoiceService:
                     if self.journal is not None and job_id is not None
                     else None
                 )
+                if self.journal is not None and job_id is not None:
+                    retry = self.journal.get(job_id)["cache"].get("delivery_retry")
+                    if retry is not None and time.time() >= retry["deadline"]:
+                        logger.warning("voice_delivery_retry_exhausted job_id=%s", job_id)
+                        return True
                 saved = (
                     ()
                     if recipient(message) or prepared is not None
@@ -692,6 +728,30 @@ class VoiceService:
             finished = True
         except DeliveryUncertain:
             logger.error("voice_delivery_uncertain")
+        except DeliveryStopped:
+            logger.info("voice_delivery_stopped message_id=%s", message.message_id)
+            finished = True
+        except TelegramForbiddenError:
+            # Telegram definitively rejected the request (blocked user / removed bot).
+            # Retaining the transcript as an uncertain send cannot recover this delivery.
+            logger.warning("voice_delivery_forbidden message_id=%s", message.message_id)
+            finished = True
+        except TelegramRetryAfter as exc:
+            job_id = self._durable_job.get()
+            if self.journal is not None and job_id is not None:
+                row = self.journal.get(job_id)
+                if row["result"] is not None and row["state"] != "uncertain":
+                    delay = self.journal.defer_delivery(
+                        job_id, max(0, exc.retry_after), window=self.settings.job_timeout_seconds
+                    )
+                    if delay is not None:
+                        deferred = True
+                        logger.info("voice_delivery_deferred job_id=%s delay=%s", job_id, delay)
+                        raise DeferredJob(delay) from None
+                    logger.warning("voice_delivery_retry_exhausted job_id=%s", job_id)
+                    finished = True
+            if not finished:
+                logger.warning("telegram_delivery_failed")
         except TelegramAPIError:
             # Never log Telegram exceptions: they may contain tokens or request bodies.
             logger.warning("telegram_delivery_failed")
@@ -703,7 +763,8 @@ class VoiceService:
             completed_ids = {item.message_id for item in completed}
             for item in messages:
                 self._silent_ids.discard(voice_keys(item)[0])
-                self._release(item, failed=admitted and item.message_id not in completed_ids)
+                if not deferred:
+                    self._release(item, failed=admitted and item.message_id not in completed_ids)
             if admitted:
                 self.active_jobs -= 1
             if task is not None:
@@ -942,7 +1003,14 @@ class VoiceService:
                         "summary_skipped message_id=%s reason=small_talk", message.message_id
                     )
                 if needs_summary and not summary_skipped:
-                    context = summary_context(messages[0])
+                    recognized_sources = [
+                        (index, item, part)
+                        for index, (item, part) in enumerate(
+                            zip(messages, transcripts, strict=True), 1
+                        )
+                        if part is not None
+                    ]
+                    context = summary_context(recognized_sources[0][1])
                     context = replace(
                         context,
                         # Unselected history must never enter the summary prompt.
@@ -994,11 +1062,15 @@ class VoiceService:
                                 )
                                 if part is not None
                             )
-                        authors = [summary_context(item) for item in messages]
+                        authors = [summary_context(item) for _, item, _ in recognized_sources]
+                        first_author_id = context_author_id(recognized_sources[0][1])
                         same_author = all(
                             (item.author_name, item.author_username)
                             == (context.author_name, context.author_username)
                             for item in authors
+                        ) and all(
+                            context_author_id(item) == first_author_id
+                            for _, item, _ in recognized_sources
                         )
                         context = replace(
                             context,
@@ -1008,9 +1080,17 @@ class VoiceService:
                             duration_seconds=sum(item.duration_seconds or 0 for item in authors),
                             voices=tuple(
                                 VoicePartContext(
-                                    i, item.author_name, item.author_username, item.duration_seconds
+                                    index,
+                                    author.author_name,
+                                    author.author_username,
+                                    author.duration_seconds,
+                                    message_id=item.message_id,
+                                    text=part,
+                                    author_id=context_author_id(item),
                                 )
-                                for i, item in enumerate(authors, 1)
+                                for (index, item, part), author in zip(
+                                    recognized_sources, authors, strict=True
+                                )
                             ),
                         )
                     try:
@@ -1233,6 +1313,7 @@ class VoiceService:
                             )
 
                         sent = await self._deliver(
+                            message,
                             "rich",
                             transmit_rich,
                             lambda value: value.message_id if not recipient(message) else 0,
@@ -1246,6 +1327,8 @@ class VoiceService:
                             else ()
                         )
                     except TelegramRetryAfter as exc:
+                        if self.journal is not None and self._durable_job.get() is not None:
+                            raise
                         if (
                             attempt
                             or exc.retry_after > self.settings.telegram_max_retry_after_seconds
@@ -1294,14 +1377,22 @@ class VoiceService:
         self, message: Message, bot: Bot, saved: tuple[int, ...]
     ) -> tuple[int, ...] | None:
         requester = self._requesters.get(voice_keys(message)[0], message)
-        if not self.replays.allow(requester):
-            return ()
+        journal, job_id = self.journal, self._durable_job.get()
+        cache = journal.get(job_id)["cache"] if journal is not None and job_id is not None else {}
+        if not cache.get("copy_admitted"):
+            if not self.replays.allow(requester):
+                return ()
+            if journal is not None and job_id is not None:
+                # Admission belongs to this job, including flood retries and restart.
+                # Keep it out of the shared result cache: new requests still need admission.
+                cache["copy_admitted"] = True
+                journal.set(job_id, "cache", cache)
         signature = hashlib.sha256(json.dumps(saved).encode()).hexdigest()
         progress_key = "copy:" + voice_keys(message)[0] + ":" + signature
         copied: list[int] = json.loads(self._result_get(progress_key) or "[]")
         try:
             for source_id in saved[len(copied) :]:
-                if not self.chat_allowed(message):
+                if not self.work_allowed(message):
                     return ()
                 for attempt in range(2):
                     try:
@@ -1318,12 +1409,17 @@ class VoiceService:
                             )
 
                         result = await self._deliver(
-                            f"copy:{source_id}", transmit_copy, lambda value: value.message_id
+                            message,
+                            f"copy:{source_id}",
+                            transmit_copy,
+                            lambda value: value.message_id,
                         )
                         copied.append(result if isinstance(result, int) else result.message_id)
                         self._result_put(progress_key, json.dumps(copied))
                         break
                     except TelegramRetryAfter as exc:
+                        if self.journal is not None and self._durable_job.get() is not None:
+                            raise
                         if (
                             attempt
                             or exc.retry_after > self.settings.telegram_max_retry_after_seconds
@@ -1357,5 +1453,7 @@ class VoiceService:
             return
         try:
             await self.send(target, text)
+        except DeliveryStopped:
+            return
         except TelegramAPIError:
             logger.warning("telegram_error_delivery_failed")

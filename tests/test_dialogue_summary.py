@@ -32,6 +32,8 @@ def response(value):
             "output": [
                 {
                     "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
                     "content": [{"type": "output_text", "text": json.dumps(value)}],
                 }
             ],
@@ -45,7 +47,7 @@ async def test_only_current_voices_and_recipient_names_reach_one_model_request(s
     def respond(request):
         payload = json.loads(request.content)
         calls.append(payload)
-        primary = json.loads(payload["input"])["dialogue"]["primary_messages"]
+        primary = json.loads(payload["input"])["primary_messages"]
         assert [item["message_id"] for item in primary] == [10, 11, 12]
         assert primary[0]["reply_recipient"] == {"id": 2, "name": "Борис"}
         assert primary[1]["reply_recipient"] == {"id": 3, "name": "Вера"}
@@ -118,7 +120,7 @@ async def test_first_long_voice_has_current_author_name_without_saved_history(se
 
     def respond(request):
         data = json.loads(json.loads(request.content)["input"])
-        assert data["dialogue"]["primary_messages"][0]["speaker"]["name"] == "Антон"
+        assert data["primary_messages"][0]["speaker"]["name"] == "Антон"
         return response({"summary": "Антон собирается на концерт."})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
