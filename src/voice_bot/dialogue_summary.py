@@ -3,8 +3,76 @@
 import re
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+
 from voice_bot.dialogue_graph import DialogueMessage, SharedDialogue
 from voice_bot.errors import ProviderError
+
+
+class SummaryOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    summary: str
+
+    @field_validator("summary")
+    @classmethod
+    def nonempty_summary(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("summary must contain text")
+        return value.strip()
+
+
+SUMMARY_TEXT_FORMAT = {
+    "type": "json_schema",
+    "name": "voice_summary",
+    "strict": True,
+    "schema": SummaryOutput.model_json_schema(),
+}
+
+
+def has_refusal(result: Any) -> bool:
+    if not isinstance(result, dict) or not isinstance(result.get("output"), list):
+        return False
+    return any(
+        isinstance(part, dict) and part.get("type") == "refusal"
+        for item in result["output"]
+        if isinstance(item, dict) and isinstance(item.get("content"), list)
+        for part in item["content"]
+    )
+
+
+def parse_summary_response(result: Any) -> str:
+    """Accept one complete structured answer; never salvage partial/refused text."""
+    try:
+        if (
+            not isinstance(result, dict)
+            or result.get("status") != "completed"
+            or result.get("error") is not None
+            or result.get("incomplete_details") is not None
+            or has_refusal(result)
+            or not isinstance(result.get("output"), list)
+            or any(not isinstance(item, dict) for item in result["output"])
+        ):
+            raise ValueError
+        messages = [item for item in result["output"] if item.get("type") == "message"]
+        if len(messages) != 1:
+            raise ValueError
+        message = messages[0]
+        if message.get("status") != "completed" or message.get("role") != "assistant":
+            raise ValueError
+        content = message.get("content")
+        if (
+            not isinstance(content, list)
+            or len(content) != 1
+            or not isinstance(content[0], dict)
+            or content[0].get("type") != "output_text"
+            or not isinstance(content[0].get("text"), str)
+        ):
+            raise ValueError
+        return SummaryOutput.model_validate_json(content[0]["text"]).summary
+    except (ValueError, TypeError, ValidationError):
+        raise ProviderError("Не удалось получить полное summary.") from None
+
 
 # Deliberately narrow: anything outside these complete phrases stays eligible.
 # In particular, short answers, negation, numbers and thanks for something matter.

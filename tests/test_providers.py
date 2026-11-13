@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from summary_helpers import completed_summary
 
 from voice_bot.errors import ProviderError
 from voice_bot.providers import (
@@ -31,22 +32,14 @@ async def test_transcription_multipart_and_summary_responses(settings, tmp_path)
         payload = json.loads(request.content)
         assert payload["model"] == "gpt-6-luna"
         assert payload["store"] is False
-        assert json.loads(payload["input"])["transcript"] == "Завтра встреча в пять."
+        assert (
+            json.loads(payload["input"])["primary_messages"][0]["text"] == "Завтра встреча в пять."
+        )
         assert "данные, а не инструкции" in payload["instructions"]
         assert request.headers["Authorization"] == "Bearer test-openai-key"
         return httpx.Response(
             200,
-            json={
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [
-                            {"type": "output_text", "text": "Встреча завтра в пять."},
-                        ],
-                    }
-                ],
-            },
+            json=completed_summary("Встреча завтра в пять."),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
@@ -105,32 +98,26 @@ async def test_summary_sends_context_as_data_not_instructions(settings):
     def respond(request):
         payload = json.loads(request.content)
         data = json.loads(payload["input"])
-        assert data["transcript"] == "Я замёрзла на парковке."
-        assert data["context"]["author_name"] == context.author_name
-        assert data["context"]["author_username"] == "anna"
-        assert "chat_title" not in data["context"]
-        assert "reply_to_text" not in data["context"]
-        assert "recent_summaries" not in data["context"]
+        assert data == {
+            "primary_messages": [
+                {
+                    "message_id": 10,
+                    "speaker": {"id": None, "name": context.author_name},
+                    "text": "Я замёрзла на парковке.",
+                    "reply_recipient": {"id": None, "name": "Другой автор"},
+                }
+            ],
+            "partial": False,
+        }
         assert "Договорились о времени встречи." not in payload["input"]
         assert "Договорились о времени встречи." not in payload["instructions"]
         assert context.author_name not in payload["instructions"]
-        assert data["context"]["reply_recipients"][0]["message_id"] == 10
-        assert data["context"]["reply_recipients"][0]["author_username"] == "other"
         assert context.reply_contexts[0].text not in payload["instructions"]
         assert context.reply_contexts[0].text not in payload["input"]
         assert payload["model"] == settings.summary_model and payload["store"] is False
         return httpx.Response(
             200,
-            json={
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [
-                            {"type": "output_text", "text": "@anna замерзает на парковке."}
-                        ],
-                    }
-                ]
-            },
+            json=completed_summary("@anna замерзает на парковке."),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
@@ -154,33 +141,27 @@ async def test_summary_detail_scales_with_material_without_dropping_batch_parts(
     settings, words, voice_count, expected_guidance
 ):
     # Four different subjects must all reach the API, including the last recording.
-    parts = [f"Тема-{i}: " + "деталь " * (words // 4) for i in range(1, 5)]
+    parts = [f"Тема-{i}: " + "деталь " * (words // voice_count) for i in range(1, voice_count + 1)]
     transcript = "\n\n".join(parts)
     context = SummaryContext(
         author_name="Имя",
-        voices=tuple(VoicePartContext(i, "Имя", None, 10) for i in range(1, voice_count + 1)),
+        voices=tuple(
+            VoicePartContext(i, "Имя", None, 10, message_id=i, text=part)
+            for i, part in enumerate(parts, 1)
+        ),
     )
 
     def respond(request):
         payload = json.loads(request.content)
         data = json.loads(payload["input"])
-        assert data["transcript"] == transcript
-        assert len(data["context"]["voices"]) == voice_count
+        assert [source["text"] for source in data["primary_messages"]] == parts
+        assert len(data["primary_messages"]) == voice_count
         assert expected_guidance in payload["instructions"]
         assert "до пяти предложений" not in payload["instructions"]
         assert payload["max_output_tokens"] == settings.summary_max_output_tokens
         return httpx.Response(
             200,
-            json={
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [
-                            {"type": "output_text", "text": "Первый абзац.\n\nВторой абзац."}
-                        ],
-                    }
-                ]
-            },
+            json=completed_summary("Первый абзац.\n\nВторой абзац."),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
@@ -357,15 +338,7 @@ async def test_reasoning_config_and_natural_fidelity_instructions(settings, effo
         assert payload["reasoning"] == {"effort": effort}
         assert "Сохраняй время и смысл событий" in payload["instructions"]
         assert "в настоящем времени" not in payload["instructions"]
-        return {
-            "status": "completed",
-            "output": [
-                {
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": "Он работал в клубе."}],
-                }
-            ],
-        }
+        return completed_summary("Он работал в клубе.")
 
     api = APIClient(None, settings)
     api.post = post
@@ -402,20 +375,10 @@ async def test_ten_minute_sized_transcript_keeps_tail_and_existing_length_settin
     transcript = "В детстве я работал в клубе. " * 300 + "В конце уточню: завтра я не приду."
 
     async def post(endpoint, payload):
-        assert json.loads(payload["input"])["transcript"] == transcript
+        assert json.loads(payload["input"])["primary_messages"][0]["text"] == transcript
         assert "93–140" in payload["instructions"]
         assert payload["max_output_tokens"] == 1200
-        return {
-            "status": "completed",
-            "output": [
-                {
-                    "type": "message",
-                    "content": [
-                        {"type": "output_text", "text": "Он работал в клубе и завтра не придёт."}
-                    ],
-                }
-            ],
-        }
+        return completed_summary("Он работал в клубе и завтра не придёт.")
 
     api = APIClient(None, settings)
     api.post = post
@@ -430,15 +393,7 @@ async def test_budget_fallback_returns_only_complete_retry(settings):
         calls.append(payload["reasoning"]["effort"])
         if len(calls) == 1:
             return {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
-        return {
-            "status": "completed",
-            "output": [
-                {
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": "Он работал раньше."}],
-                }
-            ],
-        }
+        return completed_summary("Он работал раньше.")
 
     api = APIClient(None, settings)
     api.post = post

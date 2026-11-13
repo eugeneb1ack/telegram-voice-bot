@@ -12,6 +12,7 @@ from aiogram.types import (
     MessageOriginUser,
     User,
 )
+from summary_helpers import completed_summary
 from test_rendering import ParsedReply
 
 from voice_bot.providers import APIClient, HTTPSummarizer, SummaryContext, VoicePartContext
@@ -32,11 +33,7 @@ def author_message(user=None, *, origin=None, sender_chat=None):
 async def summarize_body(settings, context, body="Встреча в семь."):
     api = SimpleNamespace(
         settings=settings,
-        post=AsyncMock(
-            return_value={
-                "output": [{"type": "message", "content": [{"type": "output_text", "text": body}]}]
-            }
-        ),
+        post=AsyncMock(return_value=completed_summary(body)),
     )
     return await HTTPSummarizer(api).summarize("Согласна на встречу в семь.", context=context)
 
@@ -144,7 +141,11 @@ async def test_summary_result_prioritizes_name_even_when_model_omits_author(
         author_name=name,
         author_username=username,
         author_source="sender",
-        voices=(VoicePartContext(1, "Олег", "oleg_nickname", 15),),
+        voices=(
+            VoicePartContext(
+                1, name, username, 15, message_id=10, text="Согласна на встречу в семь."
+            ),
+        ),
         reply_contexts=(ReplyContext(10, 5, "Ирина", "irina_nickname", "text", "Встреча в семь."),),
     )
     requests = []
@@ -153,11 +154,7 @@ async def test_summary_result_prioritizes_name_even_when_model_omits_author(
         requests.append(json.loads(request.content))
         return httpx.Response(
             200,
-            json={
-                "output": [
-                    {"type": "message", "content": [{"type": "output_text", "text": "Итог."}]}
-                ]
-            },
+            json=completed_summary("Итог."),
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
@@ -168,11 +165,9 @@ async def test_summary_result_prioritizes_name_even_when_model_omits_author(
     assert len(requests) == 1
     assert summary == f"{label}: Итог."
     payload = requests[0]
-    metadata = json.loads(payload["input"])["context"]
-    assert metadata["author_name"] == name
-    assert metadata["author_username"] == username
-    assert metadata["voices"][0]["author_name"] == "Олег"
-    assert metadata["reply_recipients"][0]["author_name"] == "Ирина"
+    primary = json.loads(payload["input"])["primary_messages"]
+    assert primary[0]["speaker"]["name"] == (None if label == "Автор" else label)
+    assert primary[0]["reply_recipient"]["name"] == "Ирина"
     assert "anna_nickname" not in payload["instructions"]
     assert payload["max_output_tokens"] == settings.summary_max_output_tokens
     assert payload["model"] == settings.summary_model
@@ -202,7 +197,10 @@ async def test_multiple_authors_do_not_get_a_single_author_prefix(settings):
         author_name="Переславший",
         author_username="forwarder",
         author_source="multiple",
-        voices=(VoicePartContext(1, "Ирина", "irina", 15), VoicePartContext(2, "Олег", "oleg", 15)),
+        voices=(
+            VoicePartContext(1, "Ирина", "irina", 15, text="Предлагаю семь часов."),
+            VoicePartContext(2, "Олег", "oleg", 15, text="Согласен."),
+        ),
     )
     body = "Ирина предлагает семь часов; Олег согласен."
 

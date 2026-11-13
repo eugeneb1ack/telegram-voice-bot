@@ -2,6 +2,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aiogram import Bot
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import SendMessage
 from aiogram.types import Message
 
@@ -82,6 +83,14 @@ async def idle(service):
             await asyncio.sleep(0.005)
 
 
+async def deferred(service):
+    async with asyncio.timeout(3):
+        while service.queue.active_chats or not any(  # noqa: ASYNC110
+            waiting[0].not_before > time.monotonic() for waiting in service.queue.pending.values()
+        ):
+            await asyncio.sleep(0.005)
+
+
 async def test_pending_and_active_jobs_survive_shutdown(settings, tmp_path):
     path = tmp_path / "queue.db"
     sent = []
@@ -98,6 +107,7 @@ async def test_pending_and_active_jobs_survive_shutdown(settings, tmp_path):
     await asyncio.wait_for(entered.wait(), 2)
     await service.queue.close(0)
     await stop(service, bot, journal)
+
     restarted, bot, journal = runtime(settings, path, sent)
     await restarted.recover(bot)
     await idle(restarted)
@@ -470,4 +480,369 @@ async def test_manual_reconciliation_continues_without_paid_calls(settings, tmp_
     service.transcriber.transcribe.assert_not_awaited()
     service.summarizer.summarize.assert_not_awaited()
     assert status(path) == []
+    await stop(service, bot, journal)
+
+
+async def test_definite_flood_rejection_retries_frozen_reply_without_blocking_other_chats(
+    settings, tmp_path
+):
+    settings.max_concurrent_jobs = 1
+    sent = []
+    service, bot, journal = runtime(settings, tmp_path / "queue.db", sent)
+    original = bot.session.make_request.side_effect
+    rejected = False
+
+    async def request(bot, method, **kwargs):
+        nonlocal rejected
+        if isinstance(method, SendMessage) and method.chat_id == -100 and not rejected:
+            rejected = True
+            raise TelegramRetryAfter(method=method, message="SECRET", retry_after=0.02)
+        return await original(bot, method, **kwargs)
+
+    bot.session.make_request.side_effect = request
+    for item in (voice(1), voice(2), voice(3, chat=-200)):
+        await service.accept(item.as_(bot), bot)
+    await idle(service)
+    assert [(item.chat_id, item.reply_parameters.message_id) for item in sent] == [
+        (-200, 3),
+        (-100, 1),
+        (-100, 2),
+    ]
+    assert service.transcriber.transcribe.await_count == 3
+    assert service.summarizer.summarize.await_count == 3
+    assert not service._owners and not service.processed.pending
+    assert journal.recover(bot) == []
+    await stop(service, bot, journal)
+
+
+async def test_long_flood_wait_is_durable_and_keeps_admission_reserved(settings, tmp_path):
+    service, bot, journal = runtime(settings, tmp_path / "queue.db", [])
+    rejected = asyncio.Event()
+    original = bot.session.make_request.side_effect
+
+    async def request(bot, method, **kwargs):
+        if isinstance(method, SendMessage):
+            rejected.set()
+            raise TelegramRetryAfter(method=method, message="SECRET", retry_after=31)
+        return await original(bot, method, **kwargs)
+
+    bot.session.make_request.side_effect = request
+    await service.accept(voice().as_(bot), bot)
+    await asyncio.wait_for(rejected.wait(), 1)
+    await deferred(service)
+    row = journal.get(journal.recover(bot)[0][0])
+    retry = row["cache"]["delivery_retry"]
+    assert row["state"] == "retry_wait" and retry["count"] == 1
+    assert retry["not_before"] < retry["deadline"]
+    assert service.queue.size == 1 and not service.queue.active_chats
+    assert service.processed.pending and service._owners
+    assert not row["deliveries"]
+    await service.queue.close(0)
+    await stop(service, bot, journal)
+
+
+@pytest.mark.parametrize("expired", [False, True])
+async def test_deferred_retry_survives_restart_with_original_budget(
+    settings, tmp_path, expired, monkeypatch
+):
+    path = tmp_path / "queue.db"
+    sent = []
+    service, bot, journal = runtime(settings, path, sent)
+    original = bot.session.make_request.side_effect
+    rejected = asyncio.Event()
+
+    async def request(bot, method, **kwargs):
+        if isinstance(method, SendMessage):
+            rejected.set()
+            raise TelegramRetryAfter(method=method, message="SECRET", retry_after=31)
+        return await original(bot, method, **kwargs)
+
+    bot.session.make_request.side_effect = request
+    await service.accept(voice().as_(bot), bot)
+    await asyncio.wait_for(rejected.wait(), 1)
+    await deferred(service)
+    job_id = journal.recover(bot)[0][0]
+    retry = journal.get(job_id)["cache"]["delivery_retry"]
+    await service.queue.close(0)
+    await stop(service, bot, journal)
+    # Advance wall time only: restart must retain count/deadline from the original job.
+    monkeypatch.setattr(
+        "voice_bot.journal.time.time",
+        lambda: retry["deadline"] + 1 if expired else retry["not_before"] + 1,
+    )
+    service, bot, journal = runtime(settings, path, sent)
+    assert journal.get(job_id)["cache"]["delivery_retry"] == retry
+    await service.recover(bot)
+    await idle(service)
+    assert len(sent) == int(not expired)
+    service.transcriber.transcribe.assert_not_awaited()
+    service.summarizer.summarize.assert_not_awaited()
+    assert journal.recover(bot) == []
+    await stop(service, bot, journal)
+
+
+async def test_repeated_flood_rejections_exhaust_budget_and_delete_content(settings, tmp_path):
+    sent = []
+    service, bot, journal = runtime(settings, tmp_path / "queue.db", sent)
+    attempts = 0
+    original = bot.session.make_request.side_effect
+
+    async def request(bot, method, **kwargs):
+        nonlocal attempts
+        if isinstance(method, SendMessage):
+            attempts += 1
+            raise TelegramRetryAfter(method=method, message="SECRET", retry_after=0)
+        return await original(bot, method, **kwargs)
+
+    bot.session.make_request.side_effect = request
+    item = voice().as_(bot)
+    await service.accept(item, bot)
+    await idle(service)
+    assert attempts == 4 and sent == []
+    assert journal.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+    assert journal.seen(request_key(item))
+    service.transcriber.transcribe.assert_awaited_once()
+    service.summarizer.summarize.assert_awaited_once()
+    assert not service.processed.pending and not service._owners
+    await stop(service, bot, journal)
+
+
+async def test_forbidden_is_terminal_without_uncertain_job_or_transcript(settings, tmp_path):
+    service, bot, journal = runtime(settings, tmp_path / "queue.db", [])
+    original = bot.session.make_request.side_effect
+    attempts = 0
+
+    async def request(bot, method, **kwargs):
+        nonlocal attempts
+        if isinstance(method, SendMessage):
+            attempts += 1
+            raise TelegramForbiddenError(method=method, message="SECRET blocked")
+        return await original(bot, method, **kwargs)
+
+    bot.session.make_request.side_effect = request
+    item = voice().as_(bot)
+    await service.accept(item, bot)
+    await idle(service)
+    await service.accept(item, bot)
+    await idle(service)
+    assert attempts == 1
+    assert journal.db.execute("SELECT count(*) FROM jobs").fetchone()[0] == 0
+    assert journal.seen(request_key(item))
+    assert not service.processed.pending and not service._owners
+    await stop(service, bot, journal)
+
+
+def test_deferred_retry_count_and_deadline_cannot_reset_after_reopen(tmp_path, monkeypatch):
+    path = tmp_path / "queue.db"
+    now = [1000.0]
+    monkeypatch.setattr("voice_bot.journal.time.time", lambda: now[0])
+    journal = QueueJournal(path)
+    key = journal.admit(voice(), None, collecting=False, charged=False)
+    journal.set(key, "result", {"copy_ids": [777]})
+    for count in range(1, 4):
+        assert journal.defer_delivery(key, 31, window=300) == 31
+        retry = journal.get(key)["cache"]["delivery_retry"]
+        assert retry["count"] == count and retry["deadline"] == 1300
+        journal.close()
+        now[0] += 31
+        journal = QueueJournal(path)
+    assert journal.defer_delivery(key, 31, window=300) is None
+    journal.close()
+
+
+async def test_multipart_flood_retry_after_restart_keeps_receipts_and_private_quota(
+    settings, tmp_path, monkeypatch
+):
+    from aiogram.types import Chat
+
+    from voice_bot.rendering import render_replies
+
+    path = tmp_path / "queue.db"
+    sent = []
+    service, bot, journal = runtime(settings, path, sent)
+    transcript = "Речь без потерь. " * 500
+    service.transcriber.transcribe.return_value = transcript
+    original = bot.session.make_request.side_effect
+    attempted = 0
+
+    async def request(bot, method, **kwargs):
+        nonlocal attempted
+        if isinstance(method, SendMessage):
+            attempted += 1
+            if attempted == 2:
+                raise TelegramRetryAfter(method=method, message="SECRET", retry_after=31)
+        return await original(bot, method, **kwargs)
+
+    bot.session.make_request.side_effect = request
+    item = voice().model_copy(update={"chat": Chat(id=10, type="private")})
+    await service.accept(item.as_(bot), bot)
+    await deferred(service)
+    assert len(sent) == 1
+    assert next(iter(service.private_quota.users.values())).used == 1
+    retry = journal.get(journal.recover(bot)[0][0])["cache"]["delivery_retry"]
+    service.transcriber.transcribe.assert_awaited_once()
+    service.summarizer.summarize.assert_awaited_once()
+    await service.queue.close(0)
+    await stop(service, bot, journal)
+    monkeypatch.setattr("voice_bot.journal.time.time", lambda: retry["not_before"] + 1)
+    service, bot, journal = runtime(settings, path, sent)
+    await service.recover(bot)
+    await idle(service)
+    assert [part.text for part in sent] == render_replies("Итог.", transcript)
+    assert service.processed.reply_ids(item) == tuple(range(1001, 1001 + len(sent)))
+    assert next(iter(service.private_quota.users.values())).used == 1
+    service.transcriber.transcribe.assert_not_awaited()
+    service.summarizer.summarize.assert_not_awaited()
+    assert not journal.recover(bot)
+    await stop(service, bot, journal)
+
+
+async def test_recovered_deferred_reply_respects_quiet_mode(settings, tmp_path):
+    from test_service import approved_group
+
+    path = tmp_path / "queue.db"
+    journal = QueueJournal(path)
+    key = journal.admit(voice(), None, collecting=False, charged=False)
+    journal.set(key, "result", {"copy_ids": [777]})
+    journal.defer_delivery(key, 31, window=300)
+    journal.close()
+    sent = []
+    service, bot, journal = runtime(settings, path, sent)
+    approved_group(service, tmp_path, "quiet")
+    await service.recover(bot)
+    await idle(service)
+    assert not sent and not journal.recover(bot)
+    assert journal.seen(request_key(voice()))
+    service.transcriber.transcribe.assert_not_awaited()
+    service.summarizer.summarize.assert_not_awaited()
+    await stop(service, bot, journal)
+
+
+async def test_recovery_waits_for_the_persisted_retry_time(settings, tmp_path):
+    path = tmp_path / "queue.db"
+    journal = QueueJournal(path)
+    key = journal.admit(voice(), None, collecting=False, charged=False)
+    journal.set(key, "result", {"copy_ids": [777]})
+    journal.defer_delivery(key, 31, window=300)
+    retry = journal.get(key)["cache"]["delivery_retry"]
+    journal.close()
+
+    sent = []
+    service, bot, journal = runtime(settings, path, sent)
+    before = time.monotonic()
+    await service.recover(bot)
+    await asyncio.sleep(0)
+    assert service.queue.size == 1 and not service.queue.active_chats
+    pending = next(iter(service.queue.pending.values()))[0]
+    assert pending.not_before > before + 25
+    assert journal.get(key)["cache"]["delivery_retry"] == retry
+    assert not sent
+    service.transcriber.transcribe.assert_not_awaited()
+    service.summarizer.summarize.assert_not_awaited()
+    await service.queue.close(0)
+    await stop(service, bot, journal)
+
+
+async def test_multipart_retry_starts_no_new_send_after_original_deadline(
+    settings, tmp_path, monkeypatch
+):
+    now = [1000.0]
+    monkeypatch.setattr("voice_bot.service.time.time", lambda: now[0])
+    sent = []
+    service, bot, journal = runtime(settings, tmp_path / "queue.db", sent)
+    item = voice()
+    key = journal.admit(item, None, collecting=False, charged=False)
+    journal.set(
+        key,
+        "result",
+        {
+            "summary": "Итог.",
+            "transcript": "Длинная расшифровка. " * 500,
+            "title": "Коротко:",
+            "key": None,
+            "times": [],
+            "valid": [True],
+            "dialogue": False,
+        },
+    )
+    journal.set(
+        key,
+        "cache",
+        {"delivery_retry": {"count": 1, "not_before": 999, "deadline": 1010}},
+    )
+    journal.set(key, "state", "retry_wait")
+    original = bot.session.make_request.side_effect
+
+    async def request(bot, method, **kwargs):
+        result = await original(bot, method, **kwargs)
+        if isinstance(method, SendMessage):
+            now[0] = 1020
+        return result
+
+    bot.session.make_request.side_effect = request
+    await service.recover(bot)
+    await idle(service)
+    assert len(sent) == 1
+    assert journal.recover(bot) == [] and journal.seen(request_key(item))
+    service.transcriber.transcribe.assert_not_awaited()
+    service.summarizer.summarize.assert_not_awaited()
+    await stop(service, bot, journal)
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_copy_flood_retry_keeps_replay_admission_and_delivered_parts(
+    settings, tmp_path, monkeypatch, restart
+):
+    from aiogram.methods import CopyMessage
+
+    path = tmp_path / "copy-retry.db"
+    service, bot, journal = runtime(settings, path, [])
+    item = voice().as_(bot)
+    service.replays.clock = lambda: 1000.0
+    await service.processed.complete([item], (777, 778))
+    bot.copy_message = AsyncMock(
+        side_effect=[
+            SimpleNamespace(message_id=888),
+            TelegramRetryAfter(
+                method=CopyMessage(chat_id=-100, from_chat_id=-100, message_id=778),
+                message="SECRET",
+                retry_after=31 if restart else 0,
+            ),
+            SimpleNamespace(message_id=889),
+        ]
+    )
+    await service.accept(item, bot)
+    if restart:
+        await deferred(service)
+        assert [call.kwargs["message_id"] for call in bot.copy_message.await_args_list] == [
+            777,
+            778,
+        ]
+        key = journal.recover(bot)[0][0]
+        retry = journal.get(key)["cache"]["delivery_retry"]
+        await service.queue.close(0)
+        await stop(service, bot, journal)
+        monkeypatch.setattr("voice_bot.journal.time.time", lambda: retry["not_before"] + 1)
+        service, bot, journal = runtime(settings, path, [])
+        service.replays.clock = lambda: 1000.0
+        # An unrelated replay used this sender's allowance after the restart.
+        assert service.replays.allow(item)
+        bot.copy_message = AsyncMock(return_value=SimpleNamespace(message_id=889))
+        await service.recover(bot)
+    await idle(service)
+    assert [call.kwargs["message_id"] for call in bot.copy_message.await_args_list] == (
+        [778] if restart else [777, 778, 778]
+    )
+    assert service.processed.reply_ids(item) == (888, 889)
+    assert not journal.recover(bot)
+    service.transcriber.transcribe.assert_not_awaited()
+    service.summarizer.summarize.assert_not_awaited()
+    # A new user replay still needs its own allowance.
+    other = voice(2).as_(bot)
+    await service.processed.complete([other], (900,))
+    count = bot.copy_message.await_count
+    await service.accept(other, bot)
+    await idle(service)
+    assert bot.copy_message.await_count == count
+    assert not journal.recover(bot)
     await stop(service, bot, journal)

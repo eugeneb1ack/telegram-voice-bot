@@ -5,7 +5,7 @@ import logging
 import time
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from aiogram import Bot
 from aiogram.types import Message
@@ -14,11 +14,19 @@ logger = logging.getLogger(__name__)
 JobHandler = Callable[[list[Message], Bot], Awaitable[None]]
 
 
+class DeferredJob(Exception):
+    """An accepted job must retain its chat order while releasing its worker."""
+
+    def __init__(self, delay: float) -> None:
+        self.delay = max(0, delay)
+
+
 @dataclass(frozen=True)
 class VoiceJob:
     messages: tuple[Message, ...]
     bot: Bot
     queued_at: float = field(default_factory=time.monotonic)
+    not_before: float = 0
 
 
 class VoiceJobQueue:
@@ -36,7 +44,9 @@ class VoiceJobQueue:
         self.closed = False
         self._changed = asyncio.Event()
 
-    def add(self, messages: list[Message], bot: Bot, *, restoring: bool = False) -> bool:
+    def add(
+        self, messages: list[Message], bot: Bot, *, restoring: bool = False, delay: float = 0
+    ) -> bool:
         if self.closed or not messages or (not restoring and self.size >= self.max_pending):
             return False
         chat_id = messages[-1].chat.id
@@ -46,7 +56,7 @@ class VoiceJobQueue:
         if waiting is None:
             waiting = deque()
             self.pending[chat_id] = waiting
-        waiting.append(VoiceJob(tuple(messages), bot))
+        waiting.append(VoiceJob(tuple(messages), bot, not_before=time.monotonic() + delay))
         self.size += 1
         if not self.workers:
             for index in range(self.concurrency):
@@ -58,8 +68,14 @@ class VoiceJobQueue:
 
     async def _next(self) -> VoiceJob | None:
         while True:
+            now = time.monotonic()
+            earliest: float | None = None
             for chat_id in list(self.pending):
                 if chat_id in self.active_chats:
+                    continue
+                ready_at = self.pending[chat_id][0].not_before
+                if ready_at > now:
+                    earliest = min(earliest, ready_at) if earliest is not None else ready_at
                     continue
                 waiting = self.pending.pop(chat_id)
                 job = waiting.popleft()
@@ -71,7 +87,13 @@ class VoiceJobQueue:
             if self.closed and not self.size:
                 return None
             self._changed.clear()
-            await self._changed.wait()
+            try:
+                async with asyncio.timeout(
+                    max(0, earliest - time.monotonic()) if earliest is not None else None
+                ):
+                    await self._changed.wait()
+            except TimeoutError:
+                pass
 
     async def _run(self) -> None:
         while (job := await self._next()) is not None:
@@ -83,6 +105,14 @@ class VoiceJobQueue:
                     round((time.monotonic() - job.queued_at) * 1000),
                 )
                 await self.handler(list(job.messages), job.bot)
+            except DeferredJob as exc:
+                # Transfer the existing active slot back to the head of its chat.
+                # No new job is admitted: outstanding work remains bounded by
+                # max_pending + concurrency, and this chat cannot overtake its retry.
+                waiting = self.pending.pop(chat_id, deque())
+                waiting.appendleft(replace(job, not_before=time.monotonic() + exc.delay))
+                self.pending[chat_id] = waiting
+                self.size += 1
             except Exception as exc:
                 logger.warning("voice_queue_job_failed error_type=%s", type(exc).__name__)
             finally:
