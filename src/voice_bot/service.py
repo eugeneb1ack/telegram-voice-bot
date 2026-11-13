@@ -34,6 +34,7 @@ from voice_bot.deduplication import ProcessedVoices, RecentResults, voice_keys
 from voice_bot.delivery import ephemeral, forum_topic_id, recipient, reply_to
 from voice_bot.dialogue import DialogueContext, DialogueInput
 from voice_bot.dialogue_graph import shared_dialogue
+from voice_bot.dialogue_summary import has_summary_content
 from voice_bot.errors import NoSpeechError, ProviderError, RecognitionError, UserFacingError
 from voice_bot.jobs import VoiceJobQueue
 from voice_bot.journal import DeliveryUncertain, QueueJournal, request_key
@@ -859,6 +860,7 @@ class VoiceService:
         dialogue: DialogueInput | None = None
         standalone_summary: str | None = None
         completed_summary: str | None = None
+        summary_skipped = False
         reply_contexts: tuple[ReplyContext, ...] = ()
         transcripts: list[str | None] = [None] * len(messages)
         ignored = [False] * len(messages)
@@ -923,7 +925,23 @@ class VoiceService:
                         summary = (
                             "Не удалось составить краткое содержание. Полная расшифровка ниже."
                         )
-                if needs_summary and any(part is not None for part in transcripts):
+                summary_sources = [part for part in transcripts if part is not None]
+                if dialogue is not None and dialogue.shared is not None:
+                    primary_ids = {
+                        mid for branch in dialogue.shared.branches for mid in branch.message_ids
+                    }
+                    summary_sources = [
+                        node.text
+                        for node in dialogue.shared.messages
+                        if node.message_id in primary_ids
+                    ]
+                if needs_summary and not any(has_summary_content(part) for part in summary_sources):
+                    summary_skipped = True
+                    summary = None
+                    logger.info(
+                        "summary_skipped message_id=%s reason=small_talk", message.message_id
+                    )
+                if needs_summary and not summary_skipped:
                     context = summary_context(messages[0])
                     context = replace(
                         context,
@@ -1037,6 +1055,7 @@ class VoiceService:
             "summary": summary,
             "standalone_summary": standalone_summary,
             "completed_summary": completed_summary,
+            "summary_skipped": summary_skipped,
             "transcript": transcript,
             "title": title,
             "valid": [part is not None for part in transcripts],
@@ -1140,7 +1159,11 @@ class VoiceService:
                 if prepared.get("completed_summary"):
                     self.memory.sessions[key].summarized_through = message.message_id
                 self.memory.close_block(key, max(times) if times else 0)
-            elif prepared.get("standalone_summary") and key is not None:
+            elif (
+                key is not None
+                and len(key) == 3
+                and (prepared.get("standalone_summary") or prepared.get("summary_skipped"))
+            ):
                 if key in self.memory.sessions:
                     self.memory.sessions[key].summarized_through = message.message_id
                 self.memory.close_block(key, max(times) if times else 0)
@@ -1233,7 +1256,8 @@ class VoiceService:
                 # A definitive rejection is safe to fall back from, unlike a network timeout.
                 logger.warning("rich_message_rejected")
                 self._result_put("fallback:" + delivery_key, "1")
-        summary = f"Получено голосовых: {count}\n\n{summary or ''}"
+        if summary is not None:
+            summary = f"Получено голосовых: {count}\n\n{summary}"
         return await self._send_text_result(message, summary, transcript, delivery_key)
 
     async def _send_text_result(

@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator
@@ -18,6 +19,7 @@ class Settings(BaseSettings):
     stt_model: str = "gpt-transcribe"
     stt_language: str = ""
     summary_model: str = "gpt-6-luna"
+    summary_reasoning_effort: Literal["none", "low"] = "low"
     summary_language: str = "русский"
     summary_max_output_tokens: int = Field(default=1200, ge=128, le=10000)
     summary_max_input_chars: int = Field(default=100000, ge=1000, le=1000000)

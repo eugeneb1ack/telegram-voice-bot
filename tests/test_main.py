@@ -56,13 +56,14 @@ async def test_admin_is_not_published_in_bot_command_menus(settings, startup):
     assert bot.set_my_commands.await_count == 3
     for call in bot.set_my_commands.await_args_list:
         assert "admin" not in {command.command for command in call.args[0]}
+        assert "help" in {command.command for command in call.args[0]}
         assert all(command.is_ephemeral for command in call.args[0] if command.command == "text")
     group_menu = bot.set_my_commands.await_args_list[1]
     assert group_menu.kwargs["scope"].type == "all_group_chats"
     commands = {command.command: command for command in group_menu.args[0]}
-    assert set(commands) == {"start", "text", "settings"}
+    assert set(commands) == {"help", "text", "settings"}
     assert commands["text"].is_ephemeral and commands["settings"].is_ephemeral
-    assert not commands["start"].is_ephemeral
+    assert not commands["help"].is_ephemeral
 
 
 @pytest.mark.parametrize(

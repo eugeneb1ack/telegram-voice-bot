@@ -347,3 +347,108 @@ async def test_successful_provider_response_is_not_logged(settings, caplog):
     assert "private" not in caplog.text
     assert "provider_request_completed" in caplog.text
     assert "elapsed_ms=" in caplog.text
+
+
+@pytest.mark.parametrize("effort", ["none", "low"])
+async def test_reasoning_config_and_natural_fidelity_instructions(settings, effort):
+    settings.summary_reasoning_effort = effort
+
+    async def post(endpoint, payload):
+        assert payload["reasoning"] == {"effort": effort}
+        assert "Сохраняй время и смысл событий" in payload["instructions"]
+        assert "в настоящем времени" not in payload["instructions"]
+        return {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Он работал в клубе."}],
+                }
+            ],
+        }
+
+    api = APIClient(None, settings)
+    api.post = post
+    assert (
+        await HTTPSummarizer(api).summarize("В детстве я работал в клубе.") == "Он работал в клубе."
+    )
+
+
+@pytest.mark.parametrize("reason,retry", [("max_output_tokens", True), ("content_filter", False)])
+async def test_incomplete_reasoning_retries_once_without_publishing_partial(
+    settings, reason, retry
+):
+    settings.summary_reasoning_effort = "low"
+    calls = []
+
+    async def post(endpoint, payload):
+        calls.append(payload["reasoning"]["effort"])
+        return {
+            "status": "incomplete",
+            "incomplete_details": {"reason": reason},
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "PARTIAL"}]}
+            ],
+        }
+
+    api = APIClient(None, settings)
+    api.post = post
+    with pytest.raises(ProviderError):
+        await HTTPSummarizer(api).summarize("Прошлое не должно стать настоящим.")
+    assert calls == (["low", "none"] if retry else ["low"])
+
+
+async def test_ten_minute_sized_transcript_keeps_tail_and_existing_length_settings(settings):
+    transcript = "В детстве я работал в клубе. " * 300 + "В конце уточню: завтра я не приду."
+
+    async def post(endpoint, payload):
+        assert json.loads(payload["input"])["transcript"] == transcript
+        assert "93–140" in payload["instructions"]
+        assert payload["max_output_tokens"] == 1200
+        return {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "Он работал в клубе и завтра не придёт."}
+                    ],
+                }
+            ],
+        }
+
+    api = APIClient(None, settings)
+    api.post = post
+    assert "завтра не придёт" in await HTTPSummarizer(api).summarize(transcript)
+
+
+async def test_budget_fallback_returns_only_complete_retry(settings):
+    settings.summary_reasoning_effort = "low"
+    calls = []
+
+    async def post(endpoint, payload):
+        calls.append(payload["reasoning"]["effort"])
+        if len(calls) == 1:
+            return {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
+        return {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Он работал раньше."}],
+                }
+            ],
+        }
+
+    api = APIClient(None, settings)
+    api.post = post
+    assert await HTTPSummarizer(api).summarize("Раньше я работал.") == "Он работал раньше."
+    assert calls == ["low", "none"]
+
+
+def test_reasoning_env_setting_is_bounded(monkeypatch, settings):
+    monkeypatch.setenv("SUMMARY_REASONING_EFFORT", "none")
+    assert type(settings)(_env_file=None).summary_reasoning_effort == "none"
+    monkeypatch.setenv("SUMMARY_REASONING_EFFORT", "high")
+    with pytest.raises(ValueError):
+        type(settings)(_env_file=None)

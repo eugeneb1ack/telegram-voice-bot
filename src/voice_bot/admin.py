@@ -22,13 +22,37 @@ from voice_bot.modes import settings_button
 
 logger = logging.getLogger(__name__)
 GREETING = (
-    "Я перевожу голосовые в текст.\n\n"
-    "Обычный режим — расшифровываю голосовые автоматически для всей группы.\n"
-    "Тихий режим — только по /text в ответ на голосовое; результат видите только вы.\n\n"
-    "Назначьте меня администратором. Выбрать режим: /settings."
+    "Привет! Пришлите или перешлите голосовое — верну текст и, если нужно, короткий итог. "
+    "Полную расшифровку можно раскрыть в ответе.\n\n"
+    "<b>Как подключить к группе</b>\n"
+    "1. Нажмите «Добавить в группу».\n"
+    "2. Назначьте бота администратором.\n"
+    "3. Дождитесь разрешения владельца бота — запрос уйдёт автоматически.\n\n"
+    "/text в ответ на голосовое — расшифровка только для вас.\n"
+    "/settings в группе — автоматическая обработка или только по /text."
 )
 PAGE_SIZE = 6
 STATUS = {"pending": "⏳ Ожидает решения", "allowed": "✅ Разрешён", "denied": "⛔ Запрещён"}
+
+
+def group_greeting(group: Group, settings: Settings) -> str:
+    if settings.allowed_chat_ids and group.chat_id not in settings.allowed_chat_ids:
+        status = "Обработка недоступна: группа не входит в список разрешённых в настройках бота."
+    elif group.status == "pending":
+        status = "Ожидаю разрешения владельца бота. Запрос отправляется автоматически."
+    elif group.status == "denied":
+        status = "Обработка отключена владельцем бота."
+    elif group.mode == "quiet":
+        status = "Тихий режим: обрабатываю голосовые только по /text."
+    else:
+        status = "Обычный режим: автоматически расшифровываю голосовые для всей группы."
+    return (
+        "Расшифровываю голосовые и выделяю главное. Полный текст можно раскрыть в ответе.\n\n"
+        f"{status}\n\n"
+        "/text в ответ на голосовое — результат только для вас.\n"
+        "/settings — сменить режим; доступно администраторам группы.\n\n"
+        "Для работы назначьте бота администратором."
+    )
 
 
 class AdminAction(CallbackData, prefix="group"):
@@ -81,7 +105,9 @@ class GroupAdmin:
         # Try the private owner notification first; lack of group send rights must not block it.
         await self.notify(group, bot)
         if joined and greet:
-            await self.safe_send(bot, chat.id, GREETING, settings_button())
+            await self.safe_send(
+                bot, chat.id, group_greeting(group, self.settings), settings_button()
+            )
 
     async def safe_send(
         self, bot: Bot, chat_id: int, text: str, markup: InlineKeyboardMarkup | None = None
@@ -238,7 +264,10 @@ def build_admin_router(admin: GroupAdmin) -> Router:
     async def start(message: Message, bot: Bot) -> None:
         if message.chat.type in {"group", "supergroup"}:
             await admin.observe(message.chat, bot, greet=False)
-            await message.answer(GREETING, reply_markup=settings_button())
+            await message.answer(
+                group_greeting(admin.store.groups[message.chat.id], admin.settings),
+                reply_markup=settings_button(),
+            )
             return
         me = await bot.me()
         rows = [
@@ -251,7 +280,9 @@ def build_admin_router(admin: GroupAdmin) -> Router:
         ]
         if message.from_user and message.from_user.id == admin.settings.owner_id:
             rows.append([button("Управление группами", "list")])
-        await message.answer(GREETING, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await message.answer(
+            GREETING, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+        )
         if message.from_user and message.from_user.id == admin.settings.owner_id:
             admin.notification_attempts.clear()
             await admin.notify_pending(bot)
@@ -264,4 +295,11 @@ def build_admin_router(admin: GroupAdmin) -> Router:
         await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
     router.callback_query.register(admin.callback, AdminAction.filter())
+
+    @router.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
+    async def text_hint(message: Message) -> None:
+        await message.answer(
+            "Пришлите или перешлите голосовое сообщение. Как добавить бота в группу: /help."
+        )
+
     return router

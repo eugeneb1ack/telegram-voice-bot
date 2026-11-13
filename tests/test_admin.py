@@ -8,7 +8,14 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.methods import EditMessageText, GetMe, SendMessage
 from aiogram.types import Message, Update, User
 
-from voice_bot.admin import GREETING, AdminAction, GroupAdmin, build_admin_router, group_card
+from voice_bot.admin import (
+    GREETING,
+    AdminAction,
+    GroupAdmin,
+    build_admin_router,
+    group_card,
+    group_greeting,
+)
 from voice_bot.groups import GroupStore
 
 
@@ -207,7 +214,8 @@ async def test_real_aiogram_routes_group_join_and_promotion(admin):
         assert len(sends) == 2
         assert sends[0].chat_id == admin.settings.owner_id
         assert sends[0].reply_markup.inline_keyboard[0][0].text == "✅ Разрешить"
-        assert sends[1].text == GREETING
+        assert sends[1].text == group_greeting(admin.store.groups[-100], admin.settings)
+        assert "Ожидаю разрешения владельца" in sends[1].text
 
 
 @pytest.mark.parametrize("owner", [True, False])
@@ -231,3 +239,104 @@ async def test_admin_command_only_responds_to_owner(admin, owner):
         )
         await dispatcher.feed_update(bot, update)
     assert len(session.calls) == int(owner)
+
+
+def help_update(*, text="/start", chat_id=777, chat_type="private", voice=False):
+    data = {
+        "message_id": 1,
+        "date": 0,
+        "from": {"id": 777, "is_bot": False, "first_name": "User"},
+        "chat": {"id": chat_id, "type": chat_type},
+        "text": text,
+    }
+    if voice:
+        data.pop("text")
+        data["voice"] = {"file_id": "voice", "file_unique_id": "unique", "duration": 10}
+    return Update.model_validate({"update_id": 1, "message": data})
+
+
+@pytest.mark.parametrize("command", ["/start", "/help", "/start group"])
+async def test_private_help_explains_first_step_and_group_approval(admin, command):
+    dispatcher = Dispatcher()
+    dispatcher.include_router(build_admin_router(admin))
+    session = RecordingSession()
+    async with Bot(token="123456:TEST_TOKEN", session=session) as bot:
+        await dispatcher.feed_update(bot, help_update(text=command))
+    sends = [call for call in session.calls if isinstance(call, SendMessage)]
+    assert len(sends) == 1
+    reply = sends[0]
+    assert reply.text == GREETING
+    assert reply.parse_mode == "HTML"
+    assert "Пришлите или перешлите голосовое" in reply.text
+    assert "Дождитесь разрешения владельца" in reply.text
+    assert len(reply.text) < 650
+    assert reply.reply_markup.inline_keyboard[0][0].url == (
+        "https://t.me/voice_test_bot?startgroup=true"
+    )
+    assert len(reply.reply_markup.inline_keyboard) == 1
+
+
+@pytest.mark.parametrize(
+    "status,mode,expected",
+    [
+        ("pending", "auto", "Ожидаю разрешения владельца"),
+        ("denied", "auto", "Обработка отключена владельцем"),
+        ("allowed", "auto", "Обычный режим: автоматически"),
+        ("allowed", "quiet", "Тихий режим: обрабатываю голосовые только по /text"),
+    ],
+)
+async def test_group_help_reflects_actual_access_and_mode(admin, status, mode, expected):
+    group, _ = admin.store.observe(-100, "Test")
+    group = admin.store.decide(-100, group.revision, status)
+    admin.store.set_mode(-100, group.revision, mode)
+    dispatcher = Dispatcher()
+    dispatcher.include_router(build_admin_router(admin))
+    session = RecordingSession()
+    async with Bot(token="123456:TEST_TOKEN", session=session) as bot:
+        await dispatcher.feed_update(
+            bot, help_update(text="/help", chat_id=-100, chat_type="supergroup")
+        )
+    replies = [c for c in session.calls if isinstance(c, SendMessage) and c.chat_id == -100]
+    assert len(replies) == 1
+    assert expected in replies[0].text
+    assert "Нажмите «Добавить в группу»" not in replies[0].text
+    assert replies[0].reply_markup.inline_keyboard[0][0].callback_data.startswith("mode:")
+
+
+def test_group_help_does_not_promise_processing_outside_allowed_chat_list(admin):
+    group, _ = admin.store.observe(-100, "Test")
+    group = admin.store.decide(-100, group.revision, "allowed")
+    admin.settings.allowed_chat_ids = {123}
+    assert "группа не входит в список разрешённых" in group_greeting(group, admin.settings)
+
+
+@pytest.mark.parametrize(
+    "text,chat_type,voice,expected",
+    [
+        ("привет", "private", False, True),
+        ("привет", "supergroup", False, False),
+        ("/settings", "private", False, False),
+        (None, "private", True, False),
+    ],
+)
+async def test_private_text_hint_does_not_swallow_commands_or_voices(
+    admin, text, chat_type, voice, expected
+):
+    dispatcher = Dispatcher()
+    dispatcher.include_router(build_admin_router(admin))
+    session = RecordingSession()
+    async with Bot(token="123456:TEST_TOKEN", session=session) as bot:
+        await dispatcher.feed_update(
+            bot,
+            help_update(
+                text=text,
+                chat_id=777 if chat_type == "private" else -100,
+                chat_type=chat_type,
+                voice=voice,
+            ),
+        )
+    sends = [call for call in session.calls if isinstance(call, SendMessage)]
+    assert len(sends) == int(expected)
+    if expected:
+        assert "голосовое сообщение" in sends[0].text
+        assert "/help" in sends[0].text
