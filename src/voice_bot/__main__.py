@@ -50,7 +50,8 @@ async def run(settings: Settings) -> None:
             raise RuntimeError("Webhook is configured; refusing to remove it automatically")
         await bot.set_my_commands(
             [
-                BotCommand(command="start", description="Добавить бота в группу"),
+                BotCommand(command="start", description="Начать работу"),
+                BotCommand(command="help", description="Как пользоваться ботом"),
                 BotCommand(
                     command="text", description="Расшифровать только для меня", is_ephemeral=True
                 ),
@@ -64,14 +65,15 @@ async def run(settings: Settings) -> None:
                 BotCommand(
                     command="settings", description="Выбрать режим работы", is_ephemeral=True
                 ),
-                BotCommand(command="start", description="О боте"),
+                BotCommand(command="help", description="Инструкция и статус группы"),
             ],
             scope=BotCommandScopeAllGroupChats(),
         )
         try:
             await bot.set_my_commands(
                 [
-                    BotCommand(command="start", description="Добавить бота в группу"),
+                    BotCommand(command="start", description="Начать работу"),
+                    BotCommand(command="help", description="Как пользоваться ботом"),
                     BotCommand(
                         command="text",
                         description="Расшифровать только для меня",

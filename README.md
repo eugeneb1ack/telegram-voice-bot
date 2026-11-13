@@ -10,6 +10,14 @@ Telegram bot that transcribes voice messages using OpenAI.
 - Text, captions, video notes and earlier voice blocks are excluded. Reply recipient names are preserved.
 - Automatic processing or quiet mode with private `/text` replies.
 - Persistent queue for restart recovery. No reply when speech is not recognized.
+- Greetings and filler-only recordings keep their full transcript without an unnecessary summary.
+
+## Getting started
+
+Send or forward a voice message to the bot. Expand the quote to read the full transcript.
+Use `/start` or `/help` for a short guide. To connect a group, tap **Добавить в группу**,
+make the bot an administrator, and wait for the bot owner to approve the automatic request.
+In a group, `/help` shows its current access and processing mode.
 
 ## Deployment
 
@@ -44,9 +52,19 @@ For groups, make the bot an administrator, then approve the group through `/admi
 | --- | --- |
 | `/text` | Transcribe the recording being replied to; only the requester sees the result in groups |
 | `/settings` | Switch group mode: automatic or quiet; group administrators only |
-| `/start` | Show help |
+| `/start` | Start using the bot and add it to a group |
+| `/help` | Short guide; current access and mode in groups |
 | `/admin` | Approve or block groups; owner only |
 
 State is stored in the Docker volume. Audio and its transcripts are sent to OpenAI for processing.
 
 [MIT License](LICENSE)
+
+### Summary fidelity and cost
+
+Summaries preserve the original tense, uncertainty, requests, and corrections.
+`SUMMARY_REASONING_EFFORT=low` enables lightweight Luna reasoning; `none` is available
+for minimum cost. Existing summary length settings and the 600-second voice limit
+are unchanged. Reasoning shares `SUMMARY_MAX_OUTPUT_TOKENS` with visible text. Only
+an incomplete response caused by that token budget retries once with `none`; partial
+summaries are never published. STT/transcript fallback remains available.
